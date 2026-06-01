@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="RideComm">
+<link rel="apple-touch-icon" href="/icon.png">
+<title>RideComm – Helmet Intercom</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div class="app" id="app">
+  <div class="bg-grid"></div>
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="logo">🏍️</div>
+    <div class="header-text">
+      <h1>RIDECOMM</h1>
+      <p id="headerSub">Helmet Intercom · Local WiFi</p>
+    </div>
+    <div class="header-right">
+      <div class="signal-bars" id="signalBars">
+        <span></span><span></span><span></span><span></span>
+      </div>
+      <div class="status-dot" id="statusDot"></div>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════ SCREENS -->
+
+  <!-- SCREEN: JOIN -->
+  <div class="screen active" id="screenJoin">
+    <div class="section">
+      <div class="section-title">Your Name</div>
+      <input type="text" id="nameInput" placeholder="Rider 1" maxlength="16" autocomplete="off" />
+    </div>
+
+    <div class="section">
+      <div class="section-title">Room Code</div>
+      <div class="input-row">
+        <input type="text" id="roomInput" placeholder="Leave blank to create" maxlength="6"
+               class="code-input" autocomplete="off" autocapitalize="characters" />
+        <button class="btn btn-primary" id="joinBtn" onclick="joinRoom()">JOIN</button>
+      </div>
+      <p class="hint">Leave blank → new room is created. Share the 6-letter code with your group.</p>
+    </div>
+
+    <div class="info-card">
+      <div class="info-row">
+        <span class="info-icon">📡</span>
+        <span>All devices must be on the <strong>same WiFi or hotspot</strong></span>
+      </div>
+      <div class="info-row">
+        <span class="info-icon">🔒</span>
+        <span>Audio is peer-to-peer — no cloud, no recording</span>
+      </div>
+      <div class="info-row">
+        <span class="info-icon">🎙️</span>
+        <span>Push-to-talk saves battery on long rides</span>
+      </div>
+    </div>
+
+    <div class="cert-notice" id="certNotice" style="display:none; margin: 12px 20px 0; background: rgba(255,149,0,0.07); border: 1px solid rgba(255,149,0,0.2); border-radius: 12px; padding: 12px 14px;">
+      <div style="font-size:13px; color:#ff9500; font-weight:600; margin-bottom:6px;">🔐 First Time on iOS?</div>
+      <div style="font-size:12px; color:#8899bb; line-height:1.6; margin-bottom:10px;">You need to trust the local certificate once so Safari allows microphone access.</div>
+      <a href="/trust.html" style="display:block; background:linear-gradient(135deg,#ff9500,#ff5f00); color:#fff; text-align:center; padding:9px; border-radius:8px; font-size:12px; font-weight:700; letter-spacing:1px; text-decoration:none;">TRUST CERTIFICATE (first time only)</a>
+    </div>
+
+    <div class="server-status" id="serverStatus">
+      <span class="dot dot-warn"></span>
+      <span id="serverStatusText">Detecting server…</span>
+    </div>
+  </div>
+
+  <!-- SCREEN: ROOM -->
+  <div class="screen" id="screenRoom">
+
+    <!-- Connection error banner -->
+    <div id="connBanner" style="display:none; background:rgba(255,68,68,0.1); border-bottom:1px solid rgba(255,68,68,0.25); padding:10px 20px; font-size:12px; color:#ff6666; font-family:'Rajdhani',sans-serif; letter-spacing:1px; display:none; align-items:center; gap:8px;">
+      <span>⚠️</span>
+      <span id="connBannerText">Reconnecting to server...</span>
+      <button onclick="retryConnection()" style="margin-left:auto; background:rgba(255,68,68,0.15); border:1px solid rgba(255,68,68,0.3); color:#ff6666; padding:4px 10px; border-radius:6px; font-size:11px; font-family:'Rajdhani',sans-serif; cursor:pointer; letter-spacing:1px;">RETRY</button>
+    </div>
+
+    <!-- Room bar -->
+    <div class="room-bar">
+      <div>
+        <div class="room-label">ROOM</div>
+        <div class="room-code" id="roomCodeDisplay">------</div>
+      </div>
+      <button class="icon-btn" id="qrBtn" onclick="showQR()" title="Show QR code">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+          <rect x="3" y="14" width="7" height="7"/>
+          <path d="M14 14h3v3h-3zM17 17h3v3h-3zM14 20h3"/>
+        </svg>
+      </button>
+      <button class="icon-btn" onclick="copyCode()" title="Copy code">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+        </svg>
+      </button>
+      <button class="btn btn-danger" style="margin-left:auto" onclick="leaveRoom()">LEAVE</button>
+    </div>
+
+    <!-- Riders -->
+    <div class="section">
+      <div class="section-title">
+        <span>RIDERS ONLINE</span>
+        <span class="peer-count" id="peerCount">1 rider</span>
+      </div>
+      <div class="riders-list" id="ridersList"></div>
+    </div>
+
+    <!-- Volume -->
+    <div class="section vol-section">
+      <div class="section-title">SPEAKER VOLUME</div>
+      <div class="vol-row">
+        <span class="vol-icon">🔈</span>
+        <input type="range" id="volSlider" min="0" max="200" value="100" step="1" class="vol-slider" oninput="setVolume(this.value)">
+        <span class="vol-icon">🔊</span>
+        <span class="vol-val" id="volVal">100%</span>
+      </div>
+    </div>
+
+    <!-- PTT -->
+    <div class="ptt-area">
+      <div class="ptt-ring" id="pttRing">
+        <button class="ptt-btn" id="pttBtn"
+          onmousedown="startTalk()" onmouseup="stopTalk()" onmouseleave="stopTalk()"
+          ontouchstart="startTalk(event)" ontouchend="stopTalk(event)" ontouchcancel="stopTalk(event)">
+          <div class="mic-emoji">🎙️</div>
+          <div class="ptt-label" id="pttLabel">HOLD TO TALK</div>
+        </button>
+      </div>
+      <div class="ptt-hint">Hold to transmit · release to stop</div>
+    </div>
+
+    <!-- Log -->
+    <div class="section log-section">
+      <div class="section-title">ACTIVITY LOG</div>
+      <div class="log-box" id="logBox"></div>
+    </div>
+  </div>
+
+  <!-- SCREEN: QR -->
+  <div class="screen" id="screenQR">
+    <div class="qr-container">
+      <div class="section-title" style="text-align:center; margin-bottom:16px">SCAN TO JOIN ROOM</div>
+      <img id="qrImg" src="" alt="QR Code" class="qr-img">
+      <div class="qr-url" id="qrUrl"></div>
+      <div class="room-code" id="qrRoomCode" style="text-align:center; margin: 12px 0; font-size:28px; letter-spacing:8px;"></div>
+      <p class="hint" style="text-align:center">Others scan this with their camera to open RideComm and join your room.</p>
+      <button class="btn btn-primary" style="width:100%; margin-top:16px" onclick="showScreen('screenRoom')">BACK TO ROOM</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<script src="/js/peerjs.min.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>

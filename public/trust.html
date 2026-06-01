@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RideComm – Trust Certificate</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0c10; color: #e8eaf0; max-width: 430px; margin: 0 auto; padding: 0 0 40px; min-height: 100vh; }
+  .header { background: linear-gradient(135deg,#ff9500,#ff5f00); padding: 24px 20px 20px; }
+  .header h1 { font-size: 22px; font-weight: 700; color: #fff; letter-spacing: 1px; }
+  .header p  { font-size: 13px; color: rgba(255,255,255,0.8); margin-top: 4px; }
+  .warn { margin: 16px; background: rgba(255,149,0,0.08); border: 1px solid rgba(255,149,0,0.25); border-radius: 12px; padding: 13px 15px; font-size: 12px; color: #ffb340; line-height: 1.6; }
+  .steps { padding: 4px 16px; }
+  .step { display: flex; gap: 14px; padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .step:last-child { border-bottom: none; }
+  .num { background: #ff9500; color: #000; width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 15px; flex-shrink: 0; margin-top: 1px; }
+  .step-body h3 { font-size: 15px; font-weight: 600; margin-bottom: 5px; color: #fff; }
+  .step-body p  { font-size: 13px; color: #8899bb; line-height: 1.6; }
+  .step-body code { background: #1a2030; padding: 2px 8px; border-radius: 5px; font-size: 12px; color: #ff9500; font-family: monospace; }
+  .step-body .tag { display: inline-block; background: #1e2840; border: 1px solid rgba(255,149,0,0.2); color: #ff9500; padding: 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; margin: 2px 2px 0 0; }
+  .dl-btn { display: block; margin: 20px 16px 10px; background: linear-gradient(135deg,#ff9500,#ff5f00); color: #fff; text-align: center; padding: 16px; border-radius: 14px; font-weight: 700; font-size: 17px; text-decoration: none; letter-spacing: 0.5px; box-shadow: 0 4px 20px rgba(255,149,0,0.35); }
+  .app-btn { display: block; margin: 0 16px; background: #141820; color: #8899bb; text-align: center; padding: 14px; border-radius: 14px; font-size: 15px; font-weight: 600; text-decoration: none; border: 1px solid rgba(255,255,255,0.07); }
+  .divider { height: 1px; background: rgba(255,255,255,0.05); margin: 8px 16px; }
+  .status-ok { background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2); border-radius: 12px; margin: 16px; padding: 13px 15px; font-size: 13px; color: #22c55e; display: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🔐 Trust Certificate</h1>
+  <p>Required once per iPhone for microphone access</p>
+</div>
+
+<div class="warn">
+  ⚠️ This certificate is <strong>only for your local hotspot</strong>. It never leaves your private network and cannot access the internet.
+</div>
+
+<a href="/cert" class="dl-btn" id="dlBtn" onclick="onDownload()">
+  ⬇️ Step 1 — Download Certificate
+</a>
+
+<div class="status-ok" id="dlStatus">
+  ✅ Certificate downloaded! Now follow the steps below.
+</div>
+
+<div class="steps">
+
+  <div class="step">
+    <div class="num">2</div>
+    <div class="step-body">
+      <h3>Install the Profile</h3>
+      <p>After downloading, go to:<br>
+        <code>Settings</code> app → at the very top you'll see<br>
+        <span class="tag">Profile Downloaded</span> → tap it<br>
+        → tap <span class="tag">Install</span> → enter your passcode → tap <span class="tag">Install</span> again.
+      </p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="num">3</div>
+    <div class="step-body">
+      <h3>Trust the Certificate</h3>
+      <p>Go to:<br>
+        <code>Settings</code> → <code>General</code> → <code>VPN & Device Management</code><br>
+        → Under <span class="tag">CERTIFICATE TRUST SETTINGS</span><br>
+        tap <strong style="color:#fff">RideComm Local CA</strong><br>
+        → toggle <span class="tag">Enable Full Trust</span> → tap <span class="tag">Continue</span>
+      </p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="num">4</div>
+    <div class="step-body">
+      <h3>Allow Microphone</h3>
+      <p>When you open the app and tap JOIN, Safari will ask for microphone access.<br>
+        Tap <span class="tag">Allow</span> — this only happens once.
+      </p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="num">5</div>
+    <div class="step-body">
+      <h3>Open the App</h3>
+      <p>Tap the button below. The connection error will be gone and mic will work! 🎙️</p>
+    </div>
+  </div>
+
+</div>
+
+<div class="divider"></div>
+<a href="/" class="app-btn">🏍️ Open RideComm App</a>
+
+<script>
+function onDownload() {
+  setTimeout(() => {
+    document.getElementById('dlStatus').style.display = 'block';
+  }, 1500);
+}
+// Check if already trusted by testing a fetch
+fetch('/health').then(r => r.json()).then(d => {
+  if (d.ssl) {
+    document.getElementById('dlStatus').style.display = 'block';
+    document.getElementById('dlStatus').textContent = '✅ Server running with HTTPS. If you already trusted the cert, open the app!';
+  }
+}).catch(() => {});
+</script>
+</body>
+</html>
