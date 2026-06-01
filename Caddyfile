@@ -1,0 +1,20 @@
+# ── RideComm Caddy Config (EASIER than nginx!) ────────────────────────────
+# Caddy auto-gets SSL from Let's Encrypt — zero config needed!
+# 
+# Install Caddy: https://caddyserver.com/docs/install
+# Place this as: /etc/caddy/Caddyfile
+# Then: sudo systemctl reload caddy
+
+YOUR_DOMAIN {
+    reverse_proxy localhost:9000 {
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For  {remote}
+    }
+
+    # WebSocket support (automatic in Caddy)
+    @ws {
+        header Connection *Upgrade*
+        header Upgrade    websocket
+    }
+    reverse_proxy @ws localhost:9000
+}
