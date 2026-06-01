@@ -75,21 +75,32 @@ async function detectServer() {
   const statusEl = $('serverStatusText');
   const dotEl = document.querySelector('.server-status .dot');
   try {
-    const res = await fetch('/health', { signal: AbortSignal.timeout(3000) });
+    const res = await fetch('/health', { signal: AbortSignal.timeout(5000) });
     if (res.ok) {
       const data = await res.json();
       const isHttps = location.protocol === 'https:';
-      statusEl.textContent = isHttps
-        ? `Server online · HTTPS ✅ · uptime ${Math.floor(data.uptime)}s`
-        : `Server online (HTTP — use HTTPS for mic)`;
-      dotEl.className = isHttps ? 'dot dot-ok' : 'dot dot-warn';
-      // Show cert notice on HTTPS (iOS needs to trust it once)
-      const certNotice = $('certNotice');
-      if (certNotice && isHttps) certNotice.style.display = 'block';
+      const isRailway = data.platform === 'railway';
+
+      if (isRailway) {
+        statusEl.textContent = 'Railway server online ✅ · uptime ' + Math.floor(data.uptime) + 's';
+        dotEl.className = 'dot dot-ok';
+        // No cert needed on Railway — hide cert notice
+        const certNotice = $('certNotice');
+        if (certNotice) certNotice.style.display = 'none';
+      } else if (isHttps) {
+        statusEl.textContent = 'Local server online · HTTPS ✅';
+        dotEl.className = 'dot dot-ok';
+        // Show cert notice for local HTTPS (iOS needs to trust it once)
+        const certNotice = $('certNotice');
+        if (certNotice) certNotice.style.display = 'block';
+      } else {
+        statusEl.textContent = 'Server online (HTTP — mic may not work on iPhone)';
+        dotEl.className = 'dot dot-warn';
+      }
       return true;
     }
   } catch (e) {
-    statusEl.textContent = 'Server not reachable — is it running?';
+    statusEl.textContent = 'Server not reachable — check connection';
     dotEl.className = 'dot dot-err';
   }
   return false;
@@ -98,9 +109,12 @@ async function detectServer() {
 // ── WebSocket presence bus ─────────────────────────────────────────────────
 
 function connectWS(roomCode, name, peerId) {
-  // Always derive URL from current page — auto-handles any IP/port/protocol
+  // Always derive URL from current page — handles Railway wss:// automatically
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  // On Railway, location.host already includes the right domain
+  // On local, it includes IP:port — both work correctly
   const wsUrl = proto + '://' + location.host + '/ws';
+  console.log('[WS] Connecting to:', wsUrl);
 
   if (STATE.ws) {
     STATE.ws.onclose = null; // prevent reconnect loop on intentional close
@@ -191,12 +205,15 @@ function wsSend(msg) {
 function initPeer(onReady) {
   if (STATE.peer) { try { STATE.peer.destroy(); } catch(e){} STATE.peer = null; }
 
-  // Auto-detect from current page URL — works for any IP/port/protocol
+  // Auto-detect from current page URL — works for Railway and local
   const isSecure = location.protocol === 'https:';
   const host = location.hostname;
-  const port = parseInt(location.port || (isSecure ? '443' : '80'), 10);
+  // Railway uses standard ports (443 for https, 80 for http) — no custom port
+  // Local uses whatever port is in the URL
+  const defaultPort = isSecure ? 443 : 80;
+  const port = location.port ? parseInt(location.port, 10) : defaultPort;
 
-  log('Connecting PeerJS to ' + host + ':' + port + ' (' + (isSecure ? 'wss' : 'ws') + ')...', 'l-info');
+  log('Connecting PeerJS → ' + host + ':' + port + ' (' + (isSecure ? 'wss' : 'ws') + ')...', 'l-info');
 
   const peer = new Peer(undefined, {
     host,
@@ -204,11 +221,13 @@ function initPeer(onReady) {
     path: '/peerjs',
     secure: isSecure,
     debug: 0,
-    pingInterval: 5000,
+    pingInterval: 20000,
     config: {
       iceServers: [
-        { urls: 'stun:' + host + ':3478' },
+        // Public STUN servers for WebRTC hole-punching
         { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
       ]
     }
   });
@@ -681,3 +700,4 @@ window.setSignal = function(level) {
     showConnBanner(null); // hide banner when reconnected
   }
 };
+
