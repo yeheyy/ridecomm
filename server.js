@@ -13,15 +13,22 @@ const os      = require('os');
 const app = express();
 
 // ── Config ──────────────────────────────────────────────────────────────────
-// Railway sets PORT automatically — always use it
 const PORT       = parseInt(process.env.PORT || 9000);
-const IS_RAILWAY = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_SERVICE_NAME;
+const IS_RAILWAY = !!(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_SERVICE_NAME || process.env.RAILWAY_PROJECT_ID);
 const IS_PROD    = process.env.NODE_ENV === 'production' || IS_RAILWAY;
 
-// On Railway/VPS behind proxy — trust forwarded headers
 if (IS_PROD) app.set('trust proxy', 1);
 
-// ── SSL — only used for local hotspot mode ──────────────────────────────────
+// ── CORS + headers for Railway WebSocket ─────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// ── SSL — local hotspot only ─────────────────────────────────────────────────
 const certPath  = path.join(__dirname, 'certs', 'cert.pem');
 const keyPath   = path.join(__dirname, 'certs', 'key.pem');
 const chainPath = path.join(__dirname, 'certs', 'chain.pem');
@@ -35,14 +42,12 @@ if (hasSSL) {
     cert: fs.existsSync(chainPath) ? fs.readFileSync(chainPath) : fs.readFileSync(certPath),
   };
   primaryServer = https.createServer(sslOpts, app);
-  // HTTP redirect
   http.createServer((req, res) => {
     const host = req.headers.host?.split(':')[0] || '127.0.0.1';
     res.writeHead(301, { Location: `https://${host}:${PORT}${req.url}` });
     res.end();
   }).listen(9000, '0.0.0.0');
 } else {
-  // Railway / plain HTTP (Railway's edge handles SSL for us)
   primaryServer = http.createServer(app);
 }
 
@@ -55,9 +60,16 @@ const peerServer = ExpressPeerServer(primaryServer, {
 app.use('/peerjs', peerServer);
 
 // ── WebSocket presence bus ───────────────────────────────────────────────────
-const wss    = new WebSocketServer({ server: primaryServer, path: '/ws' });
-const rooms  = {};        // roomCode → Set<ws>
-const wsInfo = new Map(); // ws → { name, roomCode, peerId }
+const wss = new WebSocketServer({
+  server: primaryServer,
+  path: '/ws',
+  // Required for Railway's proxy
+  perMessageDeflate: false,
+  clientTracking: true,
+});
+
+const rooms  = {};
+const wsInfo = new Map();
 
 function broadcast(roomCode, msg, excludeWs = null) {
   const room = rooms[roomCode];
@@ -74,7 +86,12 @@ function getRoomMembers(roomCode) {
   return [...room].map(ws => wsInfo.get(ws)).filter(Boolean);
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  console.log(`[WS] New connection from ${req.socket.remoteAddress}`);
+
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
@@ -83,23 +100,18 @@ wss.on('connection', (ws) => {
       const { name, roomCode, peerId } = msg;
       if (!name || !roomCode || !peerId) return;
 
-      // Leave old room if any
       const old = wsInfo.get(ws);
       if (old?.roomCode && rooms[old.roomCode]) {
         rooms[old.roomCode].delete(ws);
         broadcast(old.roomCode, { type: 'peer_left', peerId: old.peerId, name: old.name });
       }
 
-      // Join new room
       if (!rooms[roomCode]) rooms[roomCode] = new Set();
       rooms[roomCode].add(ws);
       wsInfo.set(ws, { name, roomCode, peerId });
 
-      // Send existing members to newcomer
       const members = getRoomMembers(roomCode).filter(m => m.peerId !== peerId);
       ws.send(JSON.stringify({ type: 'room_members', members }));
-
-      // Announce to room
       broadcast(roomCode, { type: 'peer_joined', name, peerId }, ws);
       console.log(`[JOIN]  ${name} → room ${roomCode} | ${rooms[roomCode].size} riders`);
     }
@@ -127,8 +139,19 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('error', () => {});
+  ws.on('error', (e) => console.log('[WS ERROR]', e.message));
 });
+
+// ── Heartbeat — keeps Railway connections alive ──────────────────────────────
+const heartbeat = setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 25000); // every 25s — Railway times out idle at 60s
+
+wss.on('close', () => clearInterval(heartbeat));
 
 // ── Static files ─────────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
@@ -138,7 +161,7 @@ app.get('/health', (req, res) => {
   res.json({
     status:   'ok',
     uptime:   Math.floor(process.uptime()),
-    platform: IS_RAILWAY ? 'railway' : (hasSSL ? 'local-ssl' : 'local-http'),
+    platform: IS_RAILWAY ? 'railway' : (hasSSL ? 'local-ssl' : 'local'),
     rooms:    Object.keys(rooms).length,
     riders:   [...Object.values(rooms)].reduce((a, s) => a + s.size, 0),
   });
@@ -159,7 +182,7 @@ app.get('/qr', async (req, res) => {
 
 app.get('/cert', (req, res) => {
   const p = fs.existsSync(caPath) ? caPath : (fs.existsSync(certPath) ? certPath : null);
-  if (!p) return res.status(404).send('No local cert — not needed on Railway (uses real HTTPS)');
+  if (!p) return res.status(404).send('No local cert needed on Railway');
   res.setHeader('Content-Type', 'application/x-x509-ca-cert');
   res.setHeader('Content-Disposition', 'attachment; filename=ridecomm-ca.crt');
   res.sendFile(p);
@@ -172,14 +195,13 @@ primaryServer.listen(PORT, '0.0.0.0', () => {
   console.log('╠══════════════════════════════════════════════════╣');
   if (IS_RAILWAY) {
     console.log(`║  Platform : Railway ☁️                           ║`);
-    console.log(`║  Port     : ${PORT}                               ║`);
-    console.log(`║  SSL      : Handled by Railway edge              ║`);
-    console.log(`║  URL      : Check Railway dashboard              ║`);
+    console.log(`║  Port     : ${PORT}                             ║`);
+    console.log(`║  WS       : wss://your-domain.up.railway.app/ws ║`);
   } else {
-    const ip = getLocalIP();
+    const ip   = getLocalIP();
     const proto = hasSSL ? 'https' : 'http';
     console.log(`║  Platform : Local                                ║`);
-    console.log(`║  URL      : ${proto}://${ip}:${PORT}             ║`);
+    console.log(`║  URL      : ${proto}://${ip}:${PORT}            ║`);
   }
   console.log('╚══════════════════════════════════════════════════╝\n');
 });
