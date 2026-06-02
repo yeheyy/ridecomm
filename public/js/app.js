@@ -107,9 +107,6 @@ async function detectServer() {
 }
 
 // ── Socket.IO presence bus ───────────────────────────────────────────────────
-// Socket.IO works on ALL platforms including Railway, Heroku, etc.
-// Falls back to HTTP long-polling if WebSocket is blocked
-
 let _socket = null;
 
 function connectWS(roomCode, name, peerId) {
@@ -121,60 +118,81 @@ function connectWS(roomCode, name, peerId) {
 
   log('Connecting via Socket.IO...', 'l-info');
 
-  // io() is globally available from socket.io.min.js
   const socket = io({
-    transports: ['websocket', 'polling'],
+    transports: ['polling', 'websocket'],  // polling first = always works on Railway
+    upgrade: true,
     reconnection: true,
     reconnectionAttempts: Infinity,
-    reconnectionDelay: 1000,
+    reconnectionDelay: 1500,
     reconnectionDelayMax: 8000,
-    timeout: 10000,
+    timeout: 20000,
+    forceNew: true,
   });
+
   _socket = socket;
-  STATE._wsRetries = 0;
 
   socket.on('connect', () => {
     STATE.wsConnected = true;
-    STATE._wsRetries = 0;
-    const transport = socket.io.engine.transport.name;
-    log('Socket.IO connected ✓ via ' + transport, 'l-ok');
+    STATE._wsRetries  = 0;
+    const via = socket.io.engine.transport.name;
+    log('Connected ✓ via ' + via, 'l-ok');
     setSignal(4);
     $('statusDot').className = 'status-dot online';
-    // Join room immediately on connect
-    socket.emit('join', { name, roomCode, peerId });
+    showConnBanner(null);
 
-    // Log transport upgrades (polling → websocket)
+    // Join room with current peerId (may be 'pending' before PeerJS is ready)
+    socket.emit('join', { name, roomCode, peerId: STATE.myPeerId || peerId });
+
     socket.io.engine.on('upgrade', () => {
-      log('Transport upgraded to WebSocket ✓', 'l-ok');
+      log('Upgraded to WebSocket ✓', 'l-ok');
     });
   });
 
-  socket.on('msg', (data) => handleWSMsg(data));
+  // ── Server events (must match server.js exactly) ────────────────────────
+  socket.on('room_members', ({ members }) => {
+    (members || []).forEach(m => {
+      if (m.peerId && m.peerId !== STATE.myPeerId) {
+        addRiderUI(m.peerId, m.name);
+        callPeer(m.peerId);
+      }
+    });
+  });
+
+  socket.on('peer_joined', ({ name: n, peerId: pid }) => {
+    if (pid === STATE.myPeerId) return;
+    log(n + ' joined', 'l-ok');
+    toast('🏍️ ' + n + ' joined');
+    addRiderUI(pid, n);
+  });
+
+  socket.on('peer_left', ({ peerId: pid, name: n }) => {
+    log((n || 'Rider') + ' left', 'l-info');
+    toast('👋 ' + (n || 'Rider') + ' left');
+    removeRiderUI(pid);
+  });
+
+  socket.on('speaking', ({ peerId: pid, value }) => {
+    setRiderSpeaking(pid, value);
+  });
 
   socket.on('disconnect', (reason) => {
     STATE.wsConnected = false;
     setSignal(1);
-    log('Socket.IO disconnected: ' + reason, 'l-err');
+    log('Disconnected: ' + reason, 'l-err');
   });
 
   socket.on('connect_error', (err) => {
     STATE._wsRetries = (STATE._wsRetries || 0) + 1;
-    if (STATE._wsRetries <= 3) {
-      log('Socket.IO error: ' + err.message, 'l-err');
-    }
+    if (STATE._wsRetries <= 2) log('Socket error: ' + err.message, 'l-err');
     setSignal(1);
   });
 }
 
 function wsSend(msg) {
   if (!_socket || !_socket.connected) return;
-  if (msg.type === 'speaking') {
-    _socket.emit('speaking', { value: msg.value });
-  } else if (msg.type === 'leave') {
-    _socket.emit('leave');
-  } else if (msg.type === 'join') {
-    _socket.emit('join', msg);
-  }
+  if      (msg.type === 'speaking') _socket.emit('speaking', { value: msg.value });
+  else if (msg.type === 'leave')    _socket.emit('leave');
+  else if (msg.type === 'join')     _socket.emit('join', msg);
 }
 
 // ── PeerJS ─────────────────────────────────────────────────────────────────
@@ -505,16 +523,10 @@ async function joinRoom() {
   list.appendChild(selfDiv);
   updatePeerCount();
 
-  // Connect Socket.IO first (presence), then PeerJS (audio signaling)
-  connectWS(roomCode, name, 'pending');
+  // Init PeerJS first to get peerId, then connect Socket.IO
   initPeer((peerId) => {
-    // Re-join with real peerId once PeerJS is ready
-    if (_socket && _socket.connected) {
-      _socket.emit('join', { name, roomCode, peerId });
-    } else {
-      // Socket not ready yet — reconnect with real peerId
-      connectWS(roomCode, name, peerId);
-    }
+    // Now connect Socket.IO with real peerId
+    connectWS(roomCode, name, peerId);
   });
 
   log(`Joined room ${roomCode} as ${name}`, 'l-ok');
