@@ -219,11 +219,34 @@ function initPeer(onReady) {
     pingInterval: 20000,
     config: {
       iceServers: [
-        // Public STUN servers for WebRTC hole-punching
+        // STUN — discovers public IP
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun.cloudflare.com:3478' },
-      ]
+        // TURN — RELAYS audio when direct P2P fails (behind NAT/firewall/mobile network)
+        // Free public TURN servers (good for testing)
+        {
+          urls: 'turn:openrelay.metered.ca:80',
+          username: 'openrelayproject',
+          credential: 'openrelayproject',
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443',
+          username: 'openrelayproject',
+          credential: 'openrelayproject',
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+          username: 'openrelayproject',
+          credential: 'openrelayproject',
+        },
+        {
+          urls: 'turn:relay1.expressturn.com:3478',
+          username: 'efMNO4WSTBR78XKDVP',
+          credential: 'h6k7Jm8nLqPxRsTV',
+        },
+      ],
+      iceCandidatePoolSize: 10,
     }
   });
 
@@ -297,31 +320,49 @@ function attachCallHandlers(call) {
   const peerId = call.peer;
 
   call.on('stream', (remoteStream) => {
-    log('Audio stream from ' + (getRiderName(peerId) || peerId.slice(0, 8)), 'l-ok');
+    const riderName = getRiderName(peerId) || peerId.slice(0, 8);
+    log('Audio stream from ' + riderName + ' ✓', 'l-ok');
     const entry = STATE.peers[peerId] || {};
     entry.call = call;
 
-    // Web Audio for volume control
+    // ── ALWAYS use an audio element as primary output ──────────────────────
+    // Web Audio API alone doesn't route to speakers on iOS Safari
+    // Audio element is the most reliable cross-platform method
+    const audio = getOrCreateAudio(peerId);
+    audio.srcObject = remoteStream;
+    audio.volume = Math.min(STATE.volume * 2, 1);
+    audio.muted = false;
+    // Force play — required on iOS after user gesture
+    const playPromise = audio.play();
+    if (playPromise) {
+      playPromise.catch(e => {
+        log('Audio play blocked: ' + e.message + ' — tap screen', 'l-err');
+        // Try again on next user interaction
+        document.addEventListener('click', () => audio.play().catch(()=>{}), { once: true });
+        document.addEventListener('touchstart', () => audio.play().catch(()=>{}), { once: true });
+      });
+    }
+    entry.audioEl = audio;
+
+    // ── Also use Web Audio for volume boost (connect AFTER audio element) ──
     try {
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
       const source = audioCtx.createMediaStreamSource(remoteStream);
-      const gain = audioCtx.createGain();
-      gain.gain.value = STATE.volume * 2;
+      const gain   = audioCtx.createGain();
+      gain.gain.value = STATE.volume;
       source.connect(gain);
       gain.connect(audioCtx.destination);
-      entry.audioCtx = audioCtx;
-      entry.gainNode = gain;
+      entry.audioCtx  = audioCtx;
+      entry.gainNode  = gain;
     } catch(e) {
-      // Fallback: plain audio element
-      const audio = getOrCreateAudio(peerId);
-      audio.srcObject = remoteStream;
-      audio.volume = Math.min(STATE.volume * 2, 1);
-      entry.audioEl = audio;
+      log('Web Audio fallback to element only', 'l-muted');
     }
 
     STATE.peers[peerId] = entry;
     addRiderUI(peerId, getRiderName(peerId));
     setSignal(4);
+    toast('🎙️ ' + riderName + ' audio connected!');
   });
 
   call.on('close', () => {
@@ -419,8 +460,10 @@ function setVolume(val) {
   STATE.volume = pct / 100;
   $('volVal').textContent = pct + '%';
   Object.values(STATE.peers).forEach(p => {
-    if (p.gainNode) p.gainNode.gain.value = STATE.volume * 2;
-    if (p.audioEl) p.audioEl.volume = Math.min(STATE.volume * 2, 1);
+    // Audio element: max 1.0 (browser limit)
+    if (p.audioEl)  p.audioEl.volume = Math.min(STATE.volume * 2, 1);
+    // Web Audio gain: can go above 1.0 for boost
+    if (p.gainNode) p.gainNode.gain.value = STATE.volume;
   });
 }
 
