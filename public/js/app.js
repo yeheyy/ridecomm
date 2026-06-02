@@ -106,97 +106,74 @@ async function detectServer() {
   return false;
 }
 
-// ── WebSocket presence bus ─────────────────────────────────────────────────
+// ── Socket.IO presence bus ───────────────────────────────────────────────────
+// Socket.IO works on ALL platforms including Railway, Heroku, etc.
+// Falls back to HTTP long-polling if WebSocket is blocked
+
+let _socket = null;
 
 function connectWS(roomCode, name, peerId) {
-  // Always derive URL from current page — handles Railway wss:// automatically
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  // On Railway, location.host already includes the right domain
-  // On local, it includes IP:port — both work correctly
-  const wsUrl = proto + '://' + location.host + '/ws';
-  console.log('[WS] Connecting to:', wsUrl);
-
-  if (STATE.ws) {
-    STATE.ws.onclose = null; // prevent reconnect loop on intentional close
-    try { STATE.ws.close(); } catch(e){}
-    STATE.ws = null;
+  if (_socket) {
+    _socket.removeAllListeners();
+    _socket.disconnect();
+    _socket = null;
   }
 
-  log('WebSocket connecting to ' + wsUrl + '...', 'l-info');
-  const ws = new WebSocket(wsUrl);
-  STATE.ws = ws;
-  STATE._wsRetries = (STATE._wsRetries || 0);
+  log('Connecting via Socket.IO...', 'l-info');
 
-  ws.onopen = () => {
+  // io() is globally available from socket.io.min.js
+  const socket = io({
+    transports: ['websocket', 'polling'],
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 8000,
+    timeout: 10000,
+  });
+  _socket = socket;
+  STATE._wsRetries = 0;
+
+  socket.on('connect', () => {
     STATE.wsConnected = true;
     STATE._wsRetries = 0;
+    const transport = socket.io.engine.transport.name;
+    log('Socket.IO connected ✓ via ' + transport, 'l-ok');
     setSignal(4);
-    ws.send(JSON.stringify({ type: 'join', name, roomCode, peerId }));
-    log('Presence bus connected ✓', 'l-ok');
-    clearInterval(STATE.pingTimer);
-    STATE.pingTimer = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
-    }, 10000);
-  };
+    $('statusDot').className = 'status-dot online';
+    // Join room immediately on connect
+    socket.emit('join', { name, roomCode, peerId });
 
-  ws.onmessage = (e) => {
-    let msg;
-    try { msg = JSON.parse(e.data); } catch { return; }
-    handleWSMsg(msg);
-  };
-
-  ws.onclose = (evt) => {
-    STATE.wsConnected = false;
-    clearInterval(STATE.pingTimer);
-    if (!STATE.roomCode) return; // left room intentionally
-    STATE._wsRetries++;
-    const delay = Math.min(1000 * STATE._wsRetries, 8000);
-    setSignal(1);
-    log('Presence bus closed (code ' + evt.code + ') — retry in ' + (delay/1000) + 's...', 'l-err');
-    clearTimeout(STATE.reconnectTimer);
-    STATE.reconnectTimer = setTimeout(() => {
-      if (STATE.roomCode && STATE.myPeerId) {
-        connectWS(STATE.roomCode, STATE.myName, STATE.myPeerId);
-      }
-    }, delay);
-  };
-
-  ws.onerror = (e) => {
-    // onerror is always followed by onclose — let onclose handle retry
-    log('WebSocket error — check server is running on HTTPS', 'l-err');
-  };
-}
-
-function handleWSMsg(msg) {
-  if (msg.type === 'room_members') {
-    // Connect to all existing members
-    (msg.members || []).forEach(m => {
-      if (m.peerId && m.peerId !== STATE.myPeerId) {
-        addRiderUI(m.peerId, m.name);
-        callPeer(m.peerId);
-      }
+    // Log transport upgrades (polling → websocket)
+    socket.io.engine.on('upgrade', () => {
+      log('Transport upgraded to WebSocket ✓', 'l-ok');
     });
-  } else if (msg.type === 'peer_joined') {
-    if (msg.peerId !== STATE.myPeerId) {
-      log(`${msg.name} joined`, 'l-ok');
-      toast(`🏍️ ${msg.name} joined the room`);
-      addRiderUI(msg.peerId, msg.name);
-      // Don't call — they'll call us when their peer is ready
+  });
+
+  socket.on('msg', (data) => handleWSMsg(data));
+
+  socket.on('disconnect', (reason) => {
+    STATE.wsConnected = false;
+    setSignal(1);
+    log('Socket.IO disconnected: ' + reason, 'l-err');
+  });
+
+  socket.on('connect_error', (err) => {
+    STATE._wsRetries = (STATE._wsRetries || 0) + 1;
+    if (STATE._wsRetries <= 3) {
+      log('Socket.IO error: ' + err.message, 'l-err');
     }
-  } else if (msg.type === 'peer_left') {
-    log(`${msg.name || 'Rider'} left`, 'l-info');
-    toast(`👋 ${msg.name || 'Rider'} left`);
-    removeRiderUI(msg.peerId);
-  } else if (msg.type === 'speaking') {
-    setRiderSpeaking(msg.peerId, msg.value);
-  } else if (msg.type === 'pong') {
-    // keepalive ok
-  }
+    setSignal(1);
+  });
 }
 
 function wsSend(msg) {
-  if (STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
-    STATE.ws.send(JSON.stringify(msg));
+  if (!_socket || !_socket.connected) return;
+  if (msg.type === 'speaking') {
+    _socket.emit('speaking', { value: msg.value });
+  } else if (msg.type === 'leave') {
+    _socket.emit('leave');
+  } else if (msg.type === 'join') {
+    _socket.emit('join', msg);
   }
 }
 
@@ -528,9 +505,16 @@ async function joinRoom() {
   list.appendChild(selfDiv);
   updatePeerCount();
 
-  // Init PeerJS → then WS
+  // Connect Socket.IO first (presence), then PeerJS (audio signaling)
+  connectWS(roomCode, name, 'pending');
   initPeer((peerId) => {
-    connectWS(roomCode, name, peerId);
+    // Re-join with real peerId once PeerJS is ready
+    if (_socket && _socket.connected) {
+      _socket.emit('join', { name, roomCode, peerId });
+    } else {
+      // Socket not ready yet — reconnect with real peerId
+      connectWS(roomCode, name, peerId);
+    }
   });
 
   log(`Joined room ${roomCode} as ${name}`, 'l-ok');
@@ -550,10 +534,10 @@ function leaveRoom() {
 
   // Notify others then close WS
   wsSend({ type: 'leave' });
-  if (STATE.ws) {
-    STATE.ws.onclose = null; // prevent reconnect loop
-    try { STATE.ws.close(); } catch(e){}
-    STATE.ws = null;
+  if (_socket) {
+    _socket.removeAllListeners();
+    try { _socket.disconnect(); } catch(e){}
+    _socket = null;
   }
 
   // Destroy peer
@@ -579,6 +563,7 @@ function leaveRoom() {
   STATE._wsRetries = 0;
   STATE._peerRetries = 0;
   STATE._lastPeerErr = null;
+  STATE.wsConnected = false;
 
   $('statusDot').className = 'status-dot';
   $('headerSub').textContent = 'Helmet Intercom · Local WiFi';
@@ -700,4 +685,3 @@ window.setSignal = function(level) {
     showConnBanner(null); // hide banner when reconnected
   }
 };
-
