@@ -311,12 +311,16 @@ function initPeer() {
 
   // ── ICE config: NO internet STUN for pure hotspot (same LAN = no STUN needed)
   // With STUN: works over internet. Without STUN: works on same LAN/hotspot
-  const iceServers = isLocal
-    ? [] // Pure LAN — same hotspot, no STUN needed at all!
-    : [  // Cloud / Railway — need STUN for hole punching
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ];
+  // Always include TURN — works on LAN AND internet
+  const iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    // TURN relay — essential when direct P2P fails
+    { urls: 'turn:openrelay.metered.ca:80',            username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443',           username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  ];
 
   const peerConfig = isLocal
     ? { host, port, path: '/peerjs', secure: isHttps, debug: 1,
@@ -478,37 +482,47 @@ function doConnect() {
 
 // ── Play remote audio with volume control ─────────────────────────────────────
 function playRemoteAudio(peerId, name, remoteStream) {
-  // Remove old audio if any
-  const old = document.getElementById('audio_' + peerId);
-  if (old) old.remove();
+  // Remove old audio element if exists
+  const oldAudio = document.getElementById('audio_' + peerId);
+  if (oldAudio) { oldAudio.srcObject = null; oldAudio.remove(); }
 
-  // Try Web Audio API first (volume control up to 200%)
+  // PRIMARY: audio element — most reliable on iOS Safari + Android
+  const audio = document.createElement('audio');
+  audio.id         = 'audio_' + peerId;
+  audio.autoplay   = true;
+  audio.playsInline = true;
+  audio.muted      = false;
+  audio.volume     = Math.min(volume * 2, 1);
+  audio.srcObject  = remoteStream;
+  document.body.appendChild(audio);
+
+  // Force play — iOS requires this after user interaction
+  audio.play().catch(e => {
+    log('Auto-play blocked: tap screen once to enable audio', 'l-err');
+    const resume = () => { audio.play().catch(()=>{}); };
+    document.addEventListener('touchstart', resume, { once: true });
+    document.addEventListener('click', resume, { once: true });
+  });
+
+  if (connections[peerId]) connections[peerId].audioEl = audio;
+
+  // SECONDARY: Web Audio for gain boost
   try {
     const ctx  = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
     const src  = ctx.createMediaStreamSource(remoteStream);
     const gain = ctx.createGain();
-    gain.gain.value = volume * 2;
+    gain.gain.value = volume;
     src.connect(gain);
     gain.connect(ctx.destination);
     if (connections[peerId]) {
       connections[peerId].gainNode = gain;
       connections[peerId].audioCtx = ctx;
     }
-    log('Audio playing via Web Audio API ✓', 'l-ok');
-  } catch(e) {
-    // Fallback: plain audio element
-    const audio = document.createElement('audio');
-    audio.id        = 'audio_' + peerId;
-    audio.autoplay  = true;
-    audio.playsInline = true;
-    audio.srcObject = remoteStream;
-    audio.volume    = Math.min(volume * 2, 1);
-    document.body.appendChild(audio);
-    // Try to force play (some browsers need user gesture)
-    audio.play().catch(() => {});
-    if (connections[peerId]) connections[peerId].audioEl = audio;
-    log('Audio playing via Audio element ✓', 'l-ok');
-  }
+  } catch(e) {}
+
+  log('🔊 Audio connected: ' + name + ' ✓', 'l-ok');
+  toast('🔊 Hearing ' + name + ' now!');
 }
 
 function cleanupConn(peerId) {
