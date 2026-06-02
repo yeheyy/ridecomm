@@ -18,6 +18,7 @@
     "peerjs": "^1.5.2",
     "qrcode": "^1.5.3",
     "selfsigned": "^2.4.1",
+    "socket.io": "^4.8.3",
     "ws": "^8.16.0"
   },
   "license": "MIT"
