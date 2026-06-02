@@ -1,14 +1,14 @@
 'use strict';
 
-const express = require('express');
-const http    = require('http');
-const https   = require('https');
-const fs      = require('fs');
-const path    = require('path');
-const WebSocket = require('ws');
+const express  = require('express');
+const http     = require('http');
+const https    = require('https');
+const fs       = require('fs');
+const path     = require('path');
+const { Server: SocketIO } = require('socket.io');
 const { ExpressPeerServer } = require('peer');
-const QRCode  = require('qrcode');
-const os      = require('os');
+const QRCode   = require('qrcode');
+const os       = require('os');
 
 const app = express();
 
@@ -48,7 +48,7 @@ if (hasSSL) {
   }).listen(9000, '0.0.0.0');
 }
 
-// ── PeerJS ────────────────────────────────────────────────────────────────────
+// ── PeerJS signaling ──────────────────────────────────────────────────────────
 const peerServer = ExpressPeerServer(primaryServer, {
   debug: false,
   path: '/',
@@ -56,119 +56,107 @@ const peerServer = ExpressPeerServer(primaryServer, {
 });
 app.use('/peerjs', peerServer);
 
-// ── WebSocket — NO path filter, handle upgrade manually ──────────────────────
-// Railway's proxy strips paths during upgrade — this is why /ws path fails
-const wss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
+// ── Socket.IO — replaces raw WebSocket ───────────────────────────────────────
+// Socket.IO uses long-polling as fallback when WebSocket is blocked
+// This ALWAYS works on Railway, Heroku, etc.
+const io = new SocketIO(primaryServer, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  // Try WebSocket first, fall back to long-polling if blocked
+  transports: ['websocket', 'polling'],
+  allowUpgrades: true,
+  pingTimeout:  20000,
+  pingInterval: 10000,
+});
 
-const rooms  = {};
-const wsInfo = new Map();
+const rooms  = {};  // roomCode → Set<socketId>
+const info   = {};  // socketId → { name, roomCode, peerId }
 
-function broadcast(roomCode, msg, excludeWs = null) {
+function broadcast(roomCode, msg, excludeId = null) {
   const room = rooms[roomCode];
   if (!room) return;
-  const payload = JSON.stringify(msg);
-  room.forEach(ws => {
-    if (ws !== excludeWs && ws.readyState === WebSocket.OPEN) ws.send(payload);
+  room.forEach(id => {
+    if (id !== excludeId) {
+      io.to(id).emit('msg', msg);
+    }
   });
 }
 
 function getRoomMembers(roomCode) {
   const room = rooms[roomCode];
   if (!room) return [];
-  return [...room].map(ws => wsInfo.get(ws)).filter(Boolean);
+  return [...room].map(id => info[id]).filter(Boolean);
 }
 
-// Handle upgrade manually — intercept /ws and let PeerJS handle the rest
-primaryServer.on('upgrade', (req, socket, head) => {
-  const url = req.url || '';
-  console.log(`[UPGRADE] ${url}`);
+io.on('connection', (socket) => {
+  console.log(`[CONNECT] socket ${socket.id} via ${socket.conn.transport.name}`);
 
-  if (url.startsWith('/ws') || url === '/') {
-    // Our presence WebSocket
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
-    });
+  socket.on('join', ({ name, roomCode, peerId }) => {
+    if (!name || !roomCode || !peerId) return;
+
+    // Leave old room
+    const old = info[socket.id];
+    if (old?.roomCode && rooms[old.roomCode]) {
+      rooms[old.roomCode].delete(socket.id);
+      broadcast(old.roomCode, { type: 'peer_left', peerId: old.peerId, name: old.name });
+    }
+
+    // Join new room
+    if (!rooms[roomCode]) rooms[roomCode] = new Set();
+    rooms[roomCode].add(socket.id);
+    info[socket.id] = { name, roomCode, peerId, socketId: socket.id };
+
+    // Send existing members to newcomer
+    const members = getRoomMembers(roomCode).filter(m => m.peerId !== peerId);
+    socket.emit('msg', { type: 'room_members', members });
+
+    // Announce to room
+    broadcast(roomCode, { type: 'peer_joined', name, peerId }, socket.id);
+    console.log(`[JOIN]  ${name} → room ${roomCode} | ${rooms[roomCode].size} riders`);
+  });
+
+  socket.on('speaking', ({ value }) => {
+    const i = info[socket.id];
+    if (!i) return;
+    broadcast(i.roomCode, { type: 'speaking', peerId: i.peerId, value }, socket.id);
+  });
+
+  socket.on('leave', () => cleanup(socket.id));
+
+  socket.on('disconnect', (reason) => {
+    console.log(`[DISCONNECT] ${socket.id} — ${reason}`);
+    cleanup(socket.id);
+  });
+
+  socket.on('error', (e) => console.log('[SOCKET ERR]', e.message));
+});
+
+function cleanup(socketId) {
+  const i = info[socketId];
+  if (i) {
+    const { roomCode, peerId, name } = i;
+    if (rooms[roomCode]) {
+      rooms[roomCode].delete(socketId);
+      if (rooms[roomCode].size === 0) delete rooms[roomCode];
+      else broadcast(roomCode, { type: 'peer_left', peerId, name });
+    }
+    delete info[socketId];
+    console.log(`[LEAVE] ${name} left room ${roomCode}`);
   }
-  // PeerJS handles its own upgrades via /peerjs/*
-});
-
-wss.on('connection', (ws, req) => {
-  console.log(`[WS] Connected — ${req.socket?.remoteAddress || 'unknown'}`);
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
-
-  ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    if (msg.type === 'join') {
-      const { name, roomCode, peerId } = msg;
-      if (!name || !roomCode || !peerId) return;
-
-      const old = wsInfo.get(ws);
-      if (old?.roomCode && rooms[old.roomCode]) {
-        rooms[old.roomCode].delete(ws);
-        broadcast(old.roomCode, { type: 'peer_left', peerId: old.peerId, name: old.name });
-      }
-
-      if (!rooms[roomCode]) rooms[roomCode] = new Set();
-      rooms[roomCode].add(ws);
-      wsInfo.set(ws, { name, roomCode, peerId });
-
-      const members = getRoomMembers(roomCode).filter(m => m.peerId !== peerId);
-      ws.send(JSON.stringify({ type: 'room_members', members }));
-      broadcast(roomCode, { type: 'peer_joined', name, peerId }, ws);
-      console.log(`[JOIN]  ${name} → room ${roomCode} | ${rooms[roomCode].size} riders`);
-    }
-    else if (msg.type === 'speaking') {
-      const info = wsInfo.get(ws);
-      if (!info) return;
-      broadcast(info.roomCode, { type: 'speaking', peerId: info.peerId, value: msg.value }, ws);
-    }
-    else if (msg.type === 'ping') {
-      ws.send(JSON.stringify({ type: 'pong' }));
-    }
-  });
-
-  ws.on('close', (code) => {
-    const info = wsInfo.get(ws);
-    if (info) {
-      const { roomCode, peerId, name } = info;
-      if (rooms[roomCode]) {
-        rooms[roomCode].delete(ws);
-        if (rooms[roomCode].size === 0) delete rooms[roomCode];
-        else broadcast(roomCode, { type: 'peer_left', peerId, name });
-      }
-      wsInfo.delete(ws);
-      console.log(`[LEAVE] ${name} left (code ${code})`);
-    }
-  });
-
-  ws.on('error', (e) => console.log('[WS ERR]', e.message));
-});
-
-// ── Heartbeat — prevent Railway 60s idle timeout ─────────────────────────────
-const heartbeat = setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (!ws.isAlive) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 20000);
-wss.on('close', () => clearInterval(heartbeat));
+}
 
 // ── Static files ──────────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── API ───────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
+  const totalRiders = Object.values(rooms).reduce((a, s) => a + s.size, 0);
   res.json({
-    status:   'ok',
-    uptime:   Math.floor(process.uptime()),
-    platform: IS_RAILWAY ? 'railway' : (hasSSL ? 'local-ssl' : 'local'),
-    rooms:    Object.keys(rooms).length,
-    riders:   [...Object.values(rooms)].reduce((a, s) => a + s.size, 0),
-    ws_clients: wss.clients.size,
+    status:      'ok',
+    uptime:      Math.floor(process.uptime()),
+    platform:    IS_RAILWAY ? 'railway' : (hasSSL ? 'local-ssl' : 'local'),
+    rooms:       Object.keys(rooms).length,
+    riders:      totalRiders,
+    connections: io.engine.clientsCount,
   });
 });
 
@@ -199,9 +187,10 @@ primaryServer.listen(PORT, '0.0.0.0', () => {
   if (IS_RAILWAY) {
     console.log(`║  Platform : Railway ☁️                           ║`);
     console.log(`║  Port     : ${PORT}                             ║`);
-    console.log(`║  WebSocket: handled via server upgrade           ║`);
+    console.log(`║  Transport: Socket.IO (ws + polling fallback)   ║`);
   } else {
-    console.log(`║  URL      : ${hasSSL ? 'https' : 'http'}://${ip}:${PORT}  ║`);
+    console.log(`║  URL      : ${hasSSL ? 'https' : 'http'}://${ip}:${PORT}              ║`);
+    console.log(`║  Transport: Socket.IO (ws + polling fallback)   ║`);
   }
   console.log('╚══════════════════════════════════════════════════╝\n');
 });
