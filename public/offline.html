@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="RideComm Offline">
+<title>RideComm Offline</title>
+<link rel="stylesheet" href="/css/style.css">
+<style>
+  .mode-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 10px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .mode-card:hover, .mode-card.selected {
+    border-color: var(--orange-border);
+    background: var(--orange-dim);
+  }
+  .mode-icon { font-size: 32px; flex-shrink: 0; }
+  .mode-title { font-family: 'Rajdhani', sans-serif; font-size: 16px; font-weight: 700; color: var(--text); letter-spacing: 1px; }
+  .mode-desc  { font-size: 12px; color: var(--muted); margin-top: 2px; line-height: 1.5; }
+  .mode-badge { margin-left: auto; background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.25); color: #22c55e; font-size: 10px; padding: 3px 8px; border-radius: 20px; font-family: 'Rajdhani', sans-serif; letter-spacing: 1px; white-space: nowrap; flex-shrink: 0; }
+  .mode-badge.warn { background: rgba(245,158,11,0.1); border-color: rgba(245,158,11,0.25); color: #f59e0b; }
+  .step-box { background: #070810; border: 1px solid rgba(255,255,255,0.04); border-radius: 10px; padding: 12px 14px; margin-top: 10px; font-size: 12px; color: var(--muted); font-family: 'Rajdhani', sans-serif; letter-spacing: 0.5px; line-height: 1.8; display: none; }
+  .step-box.visible { display: block; }
+  .step-box strong { color: var(--orange); }
+  .peer-id-box { background: var(--surface2); border: 1px solid var(--orange-border); border-radius: 10px; padding: 10px 14px; font-family: 'Rajdhani', sans-serif; font-size: 13px; letter-spacing: 2px; color: var(--orange); word-break: break-all; margin: 8px 0; cursor: pointer; }
+  .connect-area { margin-top: 8px; display: flex; gap: 8px; }
+  .connect-area input { flex: 1; font-family: 'Rajdhani', sans-serif; font-size: 13px; letter-spacing: 1px; }
+  .riders-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .rider-tile { background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 12px; text-align: center; transition: all 0.2s; }
+  .rider-tile.speaking { border-color: var(--orange); background: var(--orange-dim); }
+  .rider-tile .r-avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--surface3); display: flex; align-items: center; justify-content: center; font-family: 'Rajdhani', sans-serif; font-size: 18px; font-weight: 700; color: var(--muted); margin: 0 auto 8px; border: 2px solid transparent; }
+  .rider-tile.speaking .r-avatar { border-color: var(--orange); color: var(--orange); background: var(--orange-dim); }
+  .rider-tile .r-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rider-tile .r-status { font-size: 10px; color: #22c55e; font-family: 'Rajdhani', sans-serif; letter-spacing: 1px; margin-top: 2px; }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="bg-grid"></div>
+
+  <header class="header">
+    <div class="logo">🏍️</div>
+    <div class="header-text">
+      <h1>RIDECOMM</h1>
+      <p id="headerSub">Offline Mode</p>
+    </div>
+    <div class="header-right">
+      <div class="signal-bars" id="signalBars"><span></span><span></span><span></span><span></span></div>
+      <div class="status-dot" id="statusDot"></div>
+    </div>
+  </header>
+
+  <!-- SCREEN: MODE SELECT -->
+  <div class="screen active" id="screenMode">
+    <div class="section">
+      <div class="section-title">YOUR NAME</div>
+      <input type="text" id="nameInput" placeholder="Rider 1" maxlength="16" autocomplete="off"/>
+    </div>
+
+    <div class="section">
+      <div class="section-title">SELECT CONNECTION MODE</div>
+
+      <div class="mode-card" id="modeHotspot" onclick="selectMode('hotspot')">
+        <div class="mode-icon">📡</div>
+        <div>
+          <div class="mode-title">WIFI HOTSPOT</div>
+          <div class="mode-desc">All phones on same hotspot · up to 8 riders · best audio quality</div>
+        </div>
+        <div class="mode-badge">RECOMMENDED</div>
+      </div>
+
+      <div class="mode-card" id="modeBluetooth" onclick="selectMode('bluetooth')">
+        <div class="mode-icon">🔵</div>
+        <div>
+          <div class="mode-title">BLUETOOTH P2P</div>
+          <div class="mode-desc">No hotspot needed · 2 riders · up to 30m range</div>
+        </div>
+        <div class="mode-badge warn">2 RIDERS MAX</div>
+      </div>
+
+      <div class="step-box" id="hotspotSteps">
+        <strong>HOTSPOT SETUP:</strong><br>
+        1. One rider enables <strong>Mobile Hotspot</strong> on their phone<br>
+        2. All other riders connect to that hotspot WiFi<br>
+        3. <strong>Host</strong> taps Create Room below<br>
+        4. Others enter the 6-letter code to join<br>
+        5. No internet needed — all local! ✅
+      </div>
+
+      <div class="step-box" id="bluetoothSteps">
+        <strong>BLUETOOTH SETUP:</strong><br>
+        1. Enable Bluetooth on both phones<br>
+        2. First rider taps <strong>Create Room</strong><br>
+        3. Second rider scans or enters Peer ID<br>
+        4. Works up to ~30 meters ✅<br>
+        <span style="color:#f59e0b">⚠️ Chrome/Android recommended for Bluetooth</span>
+      </div>
+    </div>
+
+    <div class="section" style="padding-top:0">
+      <button class="btn btn-primary" style="width:100%; padding:14px" onclick="startOffline()">
+        START OFFLINE INTERCOM
+      </button>
+    </div>
+
+    <div class="section" style="padding-top: 8px">
+      <a href="/" style="display:block; text-align:center; font-size:12px; color:var(--muted); font-family:'Rajdhani',sans-serif; letter-spacing:1px; text-decoration:none;">
+        ← Back to Online Mode (Railway)
+      </a>
+    </div>
+  </div>
+
+  <!-- SCREEN: HOTSPOT P2P -->
+  <div class="screen" id="screenHotspot">
+    <div class="room-bar">
+      <div>
+        <div class="room-label">ROOM</div>
+        <div class="room-code" id="hsRoomCode">------</div>
+      </div>
+      <button class="icon-btn" onclick="copyHsCode()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+      </button>
+      <button class="btn btn-danger" style="margin-left:auto" onclick="leaveOffline()">LEAVE</button>
+    </div>
+
+    <div class="section">
+      <div class="section-title">
+        <span>RIDERS ONLINE</span>
+        <span class="peer-count" id="hsPeerCount">1 rider</span>
+      </div>
+      <div class="riders-grid" id="hsRidersList"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">CONNECT A RIDER</div>
+      <p style="font-size:11px; color:var(--muted); font-family:'Rajdhani',sans-serif; letter-spacing:1px; margin-bottom:8px;">
+        Share your Peer ID or enter theirs to connect directly over hotspot
+      </p>
+      <div style="font-size:10px; color:var(--muted); font-family:'Rajdhani',sans-serif; letter-spacing:1px; margin-bottom:4px;">YOUR PEER ID (tap to copy)</div>
+      <div class="peer-id-box" id="myPeerIdDisplay" onclick="copyPeerId()">Generating...</div>
+      <div class="connect-area">
+        <input type="text" id="connectPeerInput" placeholder="Enter other rider's Peer ID" autocomplete="off" style="font-size:11px; letter-spacing:1px;"/>
+        <button class="btn btn-primary" onclick="connectToPeer()">CONNECT</button>
+      </div>
+    </div>
+
+    <div class="section vol-section">
+      <div class="section-title">SPEAKER VOLUME</div>
+      <div class="vol-row">
+        <span class="vol-icon">🔈</span>
+        <input type="range" id="volSlider" min="0" max="200" value="100" class="vol-slider" oninput="setVolume(this.value)">
+        <span class="vol-icon">🔊</span>
+        <span class="vol-val" id="volVal">100%</span>
+      </div>
+    </div>
+
+    <div class="ptt-area">
+      <div class="ptt-ring" id="pttRing">
+        <button class="ptt-btn" id="pttBtn"
+          onmousedown="startTalk()" onmouseup="stopTalk()" onmouseleave="stopTalk()"
+          ontouchstart="startTalk(event)" ontouchend="stopTalk(event)" ontouchcancel="stopTalk(event)">
+          <div class="mic-emoji">🎙️</div>
+          <div class="ptt-label" id="pttLabel">HOLD TO TALK</div>
+        </button>
+      </div>
+      <div class="ptt-hint">Hold to transmit · release to stop</div>
+    </div>
+
+    <div class="section log-section">
+      <div class="section-title">LOG</div>
+      <div class="log-box" id="logBox"></div>
+    </div>
+  </div>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="/js/peerjs.min.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
+</script>
+<script>
+'use strict';
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const ST = {
+  mode: null,
+  myName: '',
+  peer: null,
+  localStream: null,
+  peers: {},       // peerId → { call, gainNode, audioCtx, name }
+  isTalking: false,
+  volume: 1.0,
+};
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function $(id) { return document.getElementById(id); }
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  const s = $(id); if (s) s.classList.add('active');
+}
+let _toastT;
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(_toastT); _toastT = setTimeout(() => t.classList.remove('show'), 2200);
+}
+function log(msg, cls='l-muted') {
+  const b = $('logBox'); if (!b) return;
+  const ts = new Date().toLocaleTimeString('en',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const p  = document.createElement('p'); p.className = cls; p.textContent = `[${ts}] ${msg}`;
+  b.appendChild(p); b.scrollTop = b.scrollHeight;
+}
+function setSignal(n) {
+  const b = $('signalBars'); if (!b) return;
+  b.className = 'signal-bars' + (n > 0 ? ' s' + n : '');
+}
+function genCode() {
+  return Math.random().toString(36).substring(2,8).toUpperCase();
+}
+
+// ── Mode select ───────────────────────────────────────────────────────────────
+function selectMode(mode) {
+  ST.mode = mode;
+  document.querySelectorAll('.mode-card').forEach(c => c.classList.remove('selected'));
+  document.querySelectorAll('.step-box').forEach(b => b.classList.remove('visible'));
+  $('mode' + mode.charAt(0).toUpperCase() + mode.slice(1)).classList.add('selected');
+  $(mode + 'Steps').classList.add('visible');
+}
+
+// Pre-select hotspot
+selectMode('hotspot');
+
+// ── Start offline ─────────────────────────────────────────────────────────────
+async function startOffline() {
+  const name = $('nameInput').value.trim();
+  if (!name) { toast('Enter your name first'); return; }
+  ST.myName = name;
+
+  try {
+    ST.localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: false,
+    });
+    muteMic(true);
+  } catch(e) {
+    toast('Mic access denied — check permissions');
+    return;
+  }
+
+  if (ST.mode === 'hotspot') startHotspot();
+  else startBluetooth();
+}
+
+// ── HOTSPOT MODE — PeerJS with local broker ───────────────────────────────────
+function startHotspot() {
+  showScreen('screenHotspot');
+  $('headerSub').textContent = 'Hotspot P2P · ' + ST.myName;
+
+  // Add self to riders
+  addHsRider('self', ST.myName, true);
+
+  // Use PeerJS with a public broker for signaling ONLY
+  // Audio is always peer-to-peer (no server sees audio)
+  // Works on hotspot as long as STUN works (or even without it on same LAN)
+  initHsPeer();
+}
+
+function initHsPeer() {
+  if (ST.peer) { try { ST.peer.destroy(); } catch(e){} }
+
+  // Try local broker first, fall back to public
+  const isSecure = location.protocol === 'https:';
+  const host = location.hostname;
+  const port = location.port ? parseInt(location.port) : (isSecure ? 443 : 80);
+  const onRailway = host.includes('railway.app') || host.includes('up.railway');
+
+  let peerOpts;
+
+  if (!onRailway && host !== 'localhost' && host !== '127.0.0.1') {
+    // We're on a local hotspot server — use it for signaling
+    peerOpts = {
+      host, port, path: '/peerjs', secure: isSecure, debug: 0,
+      config: { iceServers: [
+        { urls: 'stun:' + host + ':3478' },
+        { urls: 'stun:stun.l.google.com:19302' },
+      ]}
+    };
+    log('Using local server for P2P signaling', 'l-info');
+  } else {
+    // No local server — use PeerJS public cloud for signaling
+    // Audio is STILL peer-to-peer
+    peerOpts = {
+      debug: 0,
+      config: { iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+      ]}
+    };
+    log('Using PeerJS cloud for P2P signaling (audio is local)', 'l-info');
+  }
+
+  const peer = new Peer(undefined, peerOpts);
+  ST.peer = peer;
+
+  peer.on('open', (id) => {
+    log('Peer ID ready: ' + id.slice(0,12) + '...', 'l-ok');
+    $('myPeerIdDisplay').textContent = id;
+    $('statusDot').className = 'status-dot online';
+    setSignal(3);
+  });
+
+  peer.on('call', (call) => {
+    const name = call.metadata?.name || 'Rider';
+    log('Call from ' + name, 'l-info');
+    call.answer(ST.localStream);
+    attachCall(call, call.peer, name);
+  });
+
+  peer.on('disconnected', () => {
+    setSignal(1);
+    log('Signaling disconnected — reconnecting...', 'l-err');
+    try { peer.reconnect(); } catch(e) { setTimeout(initHsPeer, 3000); }
+  });
+
+  peer.on('error', (e) => {
+    log('Peer error: ' + e.type, 'l-err');
+    setSignal(0);
+  });
+}
+
+function connectToPeer() {
+  const peerId = $('connectPeerInput').value.trim();
+  if (!peerId) { toast('Enter a Peer ID first'); return; }
+  if (!ST.peer) { toast('Not ready yet'); return; }
+  if (ST.peers[peerId]) { toast('Already connected!'); return; }
+
+  log('Calling ' + peerId.slice(0,12) + '...', 'l-info');
+  const call = ST.peer.call(peerId, ST.localStream, { metadata: { name: ST.myName } });
+  if (!call) { log('Call failed', 'l-err'); return; }
+  attachCall(call, peerId, 'Rider');
+  $('connectPeerInput').value = '';
+}
+
+function attachCall(call, peerId, name) {
+  call.on('stream', (remoteStream) => {
+    log('Audio connected with ' + name, 'l-ok');
+    toast('🏍️ ' + name + ' connected!');
+    addHsRider(peerId, name, false);
+
+    // Web Audio for volume control
+    try {
+      const ctx  = new (window.AudioContext || window.webkitAudioContext)();
+      const src  = ctx.createMediaStreamSource(remoteStream);
+      const gain = ctx.createGain();
+      gain.gain.value = ST.volume * 2;
+      src.connect(gain);
+      gain.connect(ctx.destination);
+      ST.peers[peerId] = { call, gainNode: gain, audioCtx: ctx, name };
+    } catch(e) {
+      const audio = document.createElement('audio');
+      audio.id = 'audio_' + peerId;
+      audio.autoplay = true; audio.playsInline = true;
+      audio.srcObject = remoteStream;
+      document.body.appendChild(audio);
+      ST.peers[peerId] = { call, audioEl: audio, name };
+    }
+    setSignal(4);
+    updateHsCount();
+  });
+
+  call.on('close', () => {
+    log(name + ' disconnected', 'l-info');
+    toast('👋 ' + name + ' left');
+    removeHsRider(peerId);
+    cleanupPeer(peerId);
+  });
+
+  call.on('error', (e) => {
+    log('Call error: ' + e.message, 'l-err');
+    removeHsRider(peerId);
+    cleanupPeer(peerId);
+  });
+
+  if (!ST.peers[peerId]) ST.peers[peerId] = { call, name };
+}
+
+function cleanupPeer(peerId) {
+  const p = ST.peers[peerId];
+  if (p) {
+    try { p.call?.close(); } catch(e){}
+    try { p.audioCtx?.close(); } catch(e){}
+    try { p.audioEl?.remove(); } catch(e){}
+  }
+  delete ST.peers[peerId];
+}
+
+// ── Hotspot UI ────────────────────────────────────────────────────────────────
+function addHsRider(peerId, name, isSelf) {
+  if ($('rider_' + peerId)) return;
+  const grid = $('hsRidersList');
+  const div  = document.createElement('div');
+  div.className = 'rider-tile';
+  div.id = 'rider_' + peerId;
+  div.innerHTML = `
+    <div class="r-avatar">${name[0].toUpperCase()}</div>
+    <div class="r-name">${name}${isSelf ? ' <span style="color:var(--muted);font-size:10px">(You)</span>' : ''}</div>
+    <div class="r-status">${isSelf ? '● YOU' : '● CONNECTED'}</div>
+  `;
+  if (!isSelf) {
+    div.innerHTML += `<button onclick="disconnectPeer('${peerId}')" style="margin-top:6px;background:rgba(255,68,68,0.08);border:1px solid rgba(255,68,68,0.2);color:#ff4444;border-radius:6px;padding:3px 8px;font-size:10px;cursor:pointer;font-family:'Rajdhani',sans-serif;letter-spacing:1px;">DISCONNECT</button>`;
+  }
+  grid.appendChild(div);
+  updateHsCount();
+}
+
+function removeHsRider(peerId) {
+  const el = $('rider_' + peerId);
+  if (el) el.remove();
+  updateHsCount();
+}
+
+function setRiderSpeaking(peerId, val) {
+  const el = $('rider_' + peerId);
+  if (el) { if (val) el.classList.add('speaking'); else el.classList.remove('speaking'); }
+}
+
+function updateHsCount() {
+  const n = document.querySelectorAll('#hsRidersList .rider-tile').length;
+  $('hsPeerCount').textContent = n + ' rider' + (n !== 1 ? 's' : '');
+}
+
+function copyPeerId() {
+  const id = $('myPeerIdDisplay').textContent;
+  navigator.clipboard.writeText(id).then(() => toast('Peer ID copied!')).catch(() => {});
+}
+
+function copyHsCode() {
+  const id = $('myPeerIdDisplay').textContent;
+  navigator.clipboard.writeText(id).then(() => toast('Peer ID copied — share with riders!')).catch(() => {});
+}
+
+function disconnectPeer(peerId) {
+  cleanupPeer(peerId);
+  removeHsRider(peerId);
+}
+
+// ── BLUETOOTH MODE ────────────────────────────────────────────────────────────
+async function startBluetooth() {
+  // Web Bluetooth API — only works on Chrome/Android
+  if (!navigator.bluetooth) {
+    alert('Web Bluetooth is not supported on this browser.\n\nPlease use Chrome on Android.\n\niOS Safari does not support Web Bluetooth.\n\nFor iPhone, use Hotspot mode instead.');
+    showScreen('screenMode');
+    return;
+  }
+  // Fall back to hotspot mode with BT note
+  toast('Bluetooth: use hotspot mode on iPhone');
+  ST.mode = 'hotspot';
+  startHotspot();
+}
+
+// ── PTT ───────────────────────────────────────────────────────────────────────
+function muteMic(muted) {
+  if (!ST.localStream) return;
+  ST.localStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+}
+
+function startTalk(e) {
+  if (e) e.preventDefault();
+  if (!ST.localStream || ST.isTalking) return;
+  ST.isTalking = true;
+  muteMic(false);
+  $('pttBtn').classList.add('active');
+  $('pttLabel').textContent = 'TRANSMITTING...';
+  $('pttRing').classList.add('active');
+  const me = $('rider_self');
+  if (me) me.classList.add('speaking');
+}
+
+function stopTalk(e) {
+  if (e) e.preventDefault();
+  if (!ST.isTalking) return;
+  ST.isTalking = false;
+  muteMic(true);
+  $('pttBtn').classList.remove('active');
+  $('pttLabel').textContent = 'HOLD TO TALK';
+  $('pttRing').classList.remove('active');
+  const me = $('rider_self');
+  if (me) me.classList.remove('speaking');
+}
+
+// Spacebar PTT
+document.addEventListener('keydown', e => { if (e.code === 'Space' && e.target.tagName !== 'INPUT') { e.preventDefault(); startTalk(); }});
+document.addEventListener('keyup',   e => { if (e.code === 'Space') stopTalk(); });
+
+// ── Volume ────────────────────────────────────────────────────────────────────
+function setVolume(val) {
+  const pct = parseInt(val);
+  ST.volume = pct / 100;
+  $('volVal').textContent = pct + '%';
+  Object.values(ST.peers).forEach(p => {
+    if (p.gainNode) p.gainNode.gain.value = ST.volume * 2;
+    if (p.audioEl)  p.audioEl.volume = Math.min(ST.volume * 2, 1);
+  });
+}
+
+// ── Leave ─────────────────────────────────────────────────────────────────────
+function leaveOffline() {
+  Object.keys(ST.peers).forEach(id => cleanupPeer(id));
+  ST.peers = {};
+  if (ST.peer) { try { ST.peer.destroy(); } catch(e){} ST.peer = null; }
+  if (ST.localStream) { ST.localStream.getTracks().forEach(t => t.stop()); ST.localStream = null; }
+  ST.isTalking = false;
+  $('statusDot').className = 'status-dot';
+  setSignal(0);
+  $('hsRidersList').innerHTML = '';
+  showScreen('screenMode');
+}
+
+// Wake lock
+if ('wakeLock' in navigator) navigator.wakeLock.request('screen').catch(() => {});
+</script>
+</body>
+</html>
