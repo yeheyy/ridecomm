@@ -96,13 +96,13 @@ io.on('connection', (socket) => {
     rooms[roomCode].add(socket.id);
     peers[socket.id] = { name, roomCode, peerId };
 
-    // Send current members to newcomer
+    // Send current members to newcomer FIRST (so they can call each one)
     const members = roomMembers(roomCode).filter(m => m.peerId !== peerId);
     socket.emit('room_members', { members });
+    console.log(`[JOIN] ${name} → room ${roomCode} | existing: ${members.length} | total: ${rooms[roomCode].size}`);
 
-    // Announce newcomer to room
+    // Then announce newcomer to existing riders (so they add UI only, no calling)
     roomBroadcast(roomCode, 'peer_joined', { name, peerId }, socket.id);
-    console.log(`[R] ${name} → ${roomCode} | ${rooms[roomCode].size} riders`);
   });
 
   socket.on('speaking', ({ value } = {}) => {
