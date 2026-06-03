@@ -79,9 +79,15 @@ function genCode() {
 
 // ── Audio helpers ─────────────────────────────────────────────────────────────
 function playAudio(peerId, stream) {
-  // Remove any existing audio element
+  // Safety: never play our own stream back (causes echo)
+  if (peerId === STATE.myPeerId) {
+    log('Blocked: tried to play own audio (echo prevention)', 'l-muted');
+    return null;
+  }
+
+  // Remove any existing audio element for this peer
   const old = document.getElementById('audio_' + peerId);
-  if (old) { try { old.srcObject = null; } catch(e) {} old.remove(); }
+  if (old) { try { old.srcObject = null; old.pause(); } catch(e) {} old.remove(); }
 
   const audio = document.createElement('audio');
   audio.id          = 'audio_' + peerId;
@@ -90,11 +96,12 @@ function playAudio(peerId, stream) {
   audio.controls    = false;
   audio.muted       = false;
   audio.volume      = Math.min(STATE.volume * 2, 1);
+  // Prevent echo: do not loop audio back to mic
+  audio.setAttribute('webkit-playsinline', 'true');
   audio.srcObject   = stream;
   document.body.appendChild(audio);
 
   audio.play().catch(() => {
-    // iOS blocks autoplay — retry on next tap
     const resume = () => audio.play().catch(() => {});
     document.addEventListener('touchend', resume, { once: true });
     document.addEventListener('click',    resume, { once: true });
@@ -142,26 +149,27 @@ function connectSocket(roomCode, name, peerId) {
     socket.io.engine.on('upgrade', () => log('Upgraded to WebSocket ✓', 'l-ok'));
   });
 
-  // Existing riders in room → call each one
+  // room_members: I just joined — call all existing riders
   socket.on('room_members', ({ members }) => {
     log('Room has ' + members.length + ' existing rider(s)', 'l-info');
     members.forEach(m => {
       if (!m.peerId || m.peerId === STATE.myPeerId) return;
-      log('Calling existing rider: ' + m.name, 'l-info');
+      log('Calling ' + m.name + '...', 'l-info');
       addRiderUI(m.peerId, m.name);
+      // I am the JOINER — I call the existing riders
       callPeer(m.peerId);
     });
   });
 
-  // New rider joined → they will call us, just add UI
+  // peer_joined: someone else joined — do NOT call them
+  // They will call me via their own room_members handler
+  // This prevents double calls and echo
   socket.on('peer_joined', ({ name: n, peerId: pid }) => {
     if (!pid || pid === STATE.myPeerId) return;
-    log(n + ' joined the room', 'l-ok');
+    log(n + ' joined — waiting for their call...', 'l-info');
     toast('🏍️ ' + n + ' joined');
     addRiderUI(pid, n);
-    // ALSO call them — handles race condition where both join at same time
-    // callPeer() is idempotent (won't double-call)
-    setTimeout(() => callPeer(pid), 500);
+    // DO NOT call them here — they are the joiner, they will call us
   });
 
   socket.on('peer_left', ({ peerId: pid, name: n }) => {
@@ -432,9 +440,15 @@ async function joinRoom() {
   try {
     STATE.localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl:  true,
+        echoCancellation:         { ideal: true },
+        noiseSuppression:         { ideal: true },
+        autoGainControl:          { ideal: true },
+        googEchoCancellation:     true,   // Chrome
+        googAutoGainControl:      true,   // Chrome
+        googNoiseSuppression:     true,   // Chrome
+        googHighpassFilter:       true,   // Chrome
+        googEchoCancellation2:    true,   // Chrome enhanced
+        googNoiseSuppression2:    true,   // Chrome enhanced
         sampleRate:       44100,
         channelCount:     1,
       },
