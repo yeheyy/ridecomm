@@ -1,63 +1,50 @@
 'use strict';
+// ═══════════════════════════════════════════════════════════════
+//  RideComm — Pure WebRTC + Socket.IO (no PeerJS)
+// ═══════════════════════════════════════════════════════════════
 
-// ════════════════════════════════════════════════════════════════════════════
-//  RideComm — Client App  (complete rewrite for reliable audio)
-// ════════════════════════════════════════════════════════════════════════════
-
-const STATE = {
-  myName:    '',
-  roomCode:  '',
-  myPeerId:  '',
-  isTalking: false,
-  volume:    1.0,
-  peers:     {},   // peerId → { call, audioEl, name }
-  peer:      null,
-  localStream: null,
-  // retry state
-  _peerRetries: 0,
-  _peerRetryTimer: null,
-  _lastPeerErr: null,
-};
-
-// ── ICE config with TURN relay ───────────────────────────────────────────────
-const ICE_CONFIG = {
+// ── ICE / TURN config ─────────────────────────────────────────
+const ICE = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-    // TURN servers — relay audio when direct P2P is blocked
-    { urls: 'turn:openrelay.metered.ca:80',                 username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443',                username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443?transport=tcp',  username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:80',               username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443',              username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp',username: 'openrelayproject', credential: 'openrelayproject' },
   ],
-  iceCandidatePoolSize: 10,
 };
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
-function $(id) { return document.getElementById(id); }
+// ── State ─────────────────────────────────────────────────────
+let socket      = null;
+let localStream = null;
+let myName      = '';
+let myRoom      = '';
+let isTalking   = false;
+let volume      = 1.0;
+
+// peers[socketId] = { pc: RTCPeerConnection, audioEl: HTMLAudioElement, name }
+const peers = {};
+
+// ── Helpers ───────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
 
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  const s = $(id); if (s) s.classList.add('active');
+  const el = $(id); if (el) el.classList.add('active');
 }
 
-let _toastTimer;
+let _tt;
 function toast(msg) {
-  const t = $('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(() => t.classList.remove('show'), 2500);
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(_tt); _tt = setTimeout(() => t.classList.remove('show'), 2500);
 }
 
 function log(msg, cls = 'l-muted') {
-  const box = $('logBox'); if (!box) return;
-  const ts  = new Date().toLocaleTimeString('en', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  const p   = document.createElement('p');
-  p.className   = cls;
-  p.textContent = `[${ts}] ${msg}`;
-  box.appendChild(p);
-  box.scrollTop = box.scrollHeight;
+  const b = $('logBox'); if (!b) return;
+  const ts = new Date().toLocaleTimeString('en',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const p  = document.createElement('p');
+  p.className = cls; p.textContent = `[${ts}] ${msg}`;
+  b.appendChild(p); b.scrollTop = b.scrollHeight;
 }
 
 function setSignal(n) {
@@ -66,412 +53,348 @@ function setSignal(n) {
 }
 
 function muteMic(muted) {
-  if (!STATE.localStream) return;
-  STATE.localStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+  if (!localStream) return;
+  localStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
 }
 
 function genCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
+  const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return Array.from({length:6}, () => c[Math.random()*c.length|0]).join('');
 }
 
-// ── Audio helpers ─────────────────────────────────────────────────────────────
-function playAudio(peerId, stream) {
-  // Safety: never play our own stream back (causes echo)
-  if (peerId === STATE.myPeerId) {
-    log('Blocked: tried to play own audio (echo prevention)', 'l-muted');
-    return null;
-  }
+// ── Audio output ──────────────────────────────────────────────
+function createAudio(socketId, stream) {
+  // Remove old
+  const old = document.getElementById('audio_' + socketId);
+  if (old) { old.srcObject = null; old.remove(); }
 
-  // Remove any existing audio element for this peer
-  const old = document.getElementById('audio_' + peerId);
-  if (old) { try { old.srcObject = null; old.pause(); } catch(e) {} old.remove(); }
+  const a = document.createElement('audio');
+  a.id          = 'audio_' + socketId;
+  a.autoplay    = true;
+  a.playsInline = true;
+  a.muted       = false;
+  a.volume      = Math.min(volume * 2, 1);
+  a.srcObject   = stream;
+  document.body.appendChild(a);
 
-  const audio = document.createElement('audio');
-  audio.id          = 'audio_' + peerId;
-  audio.autoplay    = true;
-  audio.playsInline = true;
-  audio.controls    = false;
-  audio.muted       = false;
-  audio.volume      = Math.min(STATE.volume * 2, 1);
-  // Prevent echo: do not loop audio back to mic
-  audio.setAttribute('webkit-playsinline', 'true');
-  audio.srcObject   = stream;
-  document.body.appendChild(audio);
-
-  audio.play().catch(() => {
-    const resume = () => audio.play().catch(() => {});
-    document.addEventListener('touchend', resume, { once: true });
-    document.addEventListener('click',    resume, { once: true });
+  // iOS Safari needs explicit play() call after user gesture
+  a.play().catch(() => {
+    const fn = () => { a.play().catch(()=>{}); };
+    document.addEventListener('touchend', fn, {once:true});
+    document.addEventListener('click',    fn, {once:true});
   });
-
-  return audio;
+  return a;
 }
 
-function stopAudio(peerId) {
-  const a = document.getElementById('audio_' + peerId);
-  if (a) { try { a.srcObject = null; a.pause(); } catch(e) {} a.remove(); }
+function removeAudio(socketId) {
+  const a = document.getElementById('audio_' + socketId);
+  if (a) { try { a.srcObject = null; a.pause(); } catch(e){} a.remove(); }
 }
 
-// ── Socket.IO ─────────────────────────────────────────────────────────────────
-let _socket = null;
+// ── WebRTC peer connection ────────────────────────────────────
+function createPC(socketId, remoteName) {
+  // Close existing
+  if (peers[socketId]) closePeer(socketId);
 
-function connectSocket(roomCode, name, peerId) {
-  if (_socket) {
-    _socket.removeAllListeners();
-    _socket.disconnect();
-    _socket = null;
+  const pc = new RTCPeerConnection(ICE);
+  peers[socketId] = { pc, name: remoteName };
+
+  // Add our mic tracks to the connection
+  localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+  // When we get remote audio — play it
+  pc.ontrack = e => {
+    log('🔊 Audio from ' + remoteName + ' ✓', 'l-ok');
+    toast('🔊 ' + remoteName + ' connected!');
+    const audioEl = createAudio(socketId, e.streams[0]);
+    peers[socketId].audioEl = audioEl;
+    setSignal(4);
+  };
+
+  // Send ICE candidates to the other peer via server
+  pc.onicecandidate = e => {
+    if (e.candidate) {
+      socket.emit('ice-candidate', { to: socketId, candidate: e.candidate });
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    const s = pc.iceConnectionState;
+    log('ICE [' + remoteName + ']: ' + s, 'l-muted');
+    if (s === 'failed') {
+      log('ICE failed — restarting...', 'l-err');
+      pc.restartIce();
+    }
+    if (s === 'disconnected' || s === 'closed') {
+      removeRiderUI(socketId);
+      closePeer(socketId);
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    log('PC [' + remoteName + ']: ' + pc.connectionState, 'l-muted');
+  };
+
+  return pc;
+}
+
+function closePeer(socketId) {
+  const p = peers[socketId];
+  if (!p) return;
+  try { p.pc.close(); } catch(e) {}
+  removeAudio(socketId);
+  delete peers[socketId];
+}
+
+// ── Caller side: create offer ─────────────────────────────────
+async function callPeer(socketId, remoteName) {
+  log('Calling ' + remoteName + '...', 'l-info');
+  const pc = createPC(socketId, remoteName);
+
+  try {
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
+    await pc.setLocalDescription(offer);
+    socket.emit('offer', { to: socketId, offer: pc.localDescription });
+    log('Offer sent to ' + remoteName, 'l-info');
+  } catch(e) {
+    log('Offer failed: ' + e.message, 'l-err');
+    closePeer(socketId);
   }
+}
 
-  log('Connecting to server...', 'l-info');
+// ── Callee side: handle offer, send answer ────────────────────
+async function handleOffer(socketId, remoteName, offer) {
+  log('Offer from ' + remoteName + ' — answering...', 'l-info');
+  const pc = createPC(socketId, remoteName);
 
-  const socket = io({
-    transports:            ['polling', 'websocket'],
-    upgrade:               true,
-    reconnection:          true,
-    reconnectionAttempts:  Infinity,
-    reconnectionDelay:     1500,
-    reconnectionDelayMax:  8000,
-    timeout:               20000,
-    forceNew:              true,
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit('answer', { to: socketId, answer: pc.localDescription });
+    log('Answer sent to ' + remoteName, 'l-info');
+  } catch(e) {
+    log('Answer failed: ' + e.message, 'l-err');
+    closePeer(socketId);
+  }
+}
+
+// ── Handle answer ─────────────────────────────────────────────
+async function handleAnswer(socketId, answer) {
+  const p = peers[socketId];
+  if (!p) return;
+  try {
+    await p.pc.setRemoteDescription(new RTCSessionDescription(answer));
+    log('Answer received — connecting...', 'l-info');
+  } catch(e) {
+    log('Set answer failed: ' + e.message, 'l-err');
+  }
+}
+
+// ── Handle ICE candidate ──────────────────────────────────────
+async function handleIce(socketId, candidate) {
+  const p = peers[socketId];
+  if (!p || !candidate) return;
+  try {
+    await p.pc.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch(e) {
+    // Ignore — can happen if PC is already closed
+  }
+}
+
+// ── Socket.IO ─────────────────────────────────────────────────
+function connectSocket(roomCode, name) {
+  if (socket) { socket.removeAllListeners(); socket.disconnect(); socket = null; }
+
+  socket = io({
+    transports: ['polling', 'websocket'],
+    upgrade: true,
+    reconnection: true,
+    reconnectionDelay: 1500,
+    reconnectionDelayMax: 8000,
+    timeout: 20000,
   });
-  _socket = socket;
 
   socket.on('connect', () => {
-    const via = socket.io.engine.transport.name;
-    log('Server connected ✓ via ' + via, 'l-ok');
+    log('Server connected ✓ via ' + socket.io.engine.transport.name, 'l-ok');
     setSignal(4);
     $('statusDot').className = 'status-dot online';
     showConnBanner(null);
-    socket.emit('join', { name, roomCode, peerId });
+    // Join room
+    socket.emit('join', { name, roomCode });
     socket.io.engine.on('upgrade', () => log('Upgraded to WebSocket ✓', 'l-ok'));
   });
 
-  // room_members: I just joined — call all existing riders
-  socket.on('room_members', ({ members }) => {
-    log('Room has ' + members.length + ' existing rider(s)', 'l-info');
+  // ── Room events ───────────────────────────────────────────────
+  // I just joined — call every existing rider
+  socket.on('room-members', ({ members }) => {
+    log('Room members: ' + members.length, 'l-info');
     members.forEach(m => {
-      if (!m.peerId || m.peerId === STATE.myPeerId) return;
-      log('Calling ' + m.name + '...', 'l-info');
-      addRiderUI(m.peerId, m.name);
-      // I am the JOINER — I call the existing riders
-      callPeer(m.peerId);
+      addRiderUI(m.socketId, m.name);
+      callPeer(m.socketId, m.name);
     });
   });
 
-  // peer_joined: someone else joined — do NOT call them
-  // They will call me via their own room_members handler
-  // This prevents double calls and echo
-  socket.on('peer_joined', ({ name: n, peerId: pid }) => {
-    if (!pid || pid === STATE.myPeerId) return;
-    log(n + ' joined — waiting for their call...', 'l-info');
+  // New rider joined the room — add UI only, they will call me
+  socket.on('peer-joined', ({ socketId: sid, name: n }) => {
+    log(n + ' joined', 'l-ok');
     toast('🏍️ ' + n + ' joined');
-    addRiderUI(pid, n);
-    // DO NOT call them here — they are the joiner, they will call us
+    addRiderUI(sid, n);
+    // Do NOT call them — they got room-members and will call us
   });
 
-  socket.on('peer_left', ({ peerId: pid, name: n }) => {
+  // Rider left
+  socket.on('peer-left', ({ socketId: sid, name: n }) => {
     log((n || 'Rider') + ' left', 'l-info');
     toast('👋 ' + (n || 'Rider') + ' left');
-    removeRiderUI(pid);
-    cleanupPeer(pid);
+    removeRiderUI(sid);
+    closePeer(sid);
   });
 
-  socket.on('speaking', ({ peerId: pid, value }) => {
-    setRiderSpeaking(pid, value);
+  // ── WebRTC signaling ──────────────────────────────────────────
+  socket.on('offer', ({ from, name: n, offer }) => {
+    if (!peers[from]) addRiderUI(from, n);
+    handleOffer(from, n || peers[from]?.name || 'Rider', offer);
+  });
+
+  socket.on('answer', ({ from, answer }) => {
+    handleAnswer(from, answer);
+  });
+
+  socket.on('ice-candidate', ({ from, candidate }) => {
+    handleIce(from, candidate);
+  });
+
+  // Speaking indicator
+  socket.on('speaking', ({ socketId: sid, value }) => {
+    setRiderSpeaking(sid, value);
   });
 
   socket.on('disconnect', reason => {
-    STATE.wsConnected = false;
     setSignal(1);
-    log('Server disconnected: ' + reason, 'l-err');
+    log('Disconnected: ' + reason, 'l-err');
+    $('statusDot').className = 'status-dot error';
   });
 
   socket.on('connect_error', err => {
-    log('Connection error: ' + err.message, 'l-err');
+    log('Connect error: ' + err.message, 'l-err');
     setSignal(1);
   });
 }
 
-function wsSend(msg) {
-  if (!_socket?.connected) return;
-  if      (msg.type === 'speaking') _socket.emit('speaking', { value: msg.value });
-  else if (msg.type === 'leave')    _socket.emit('leave');
-  else if (msg.type === 'join')     _socket.emit('join', msg);
-}
-
-// ── PeerJS ────────────────────────────────────────────────────────────────────
-function initPeer(onReady) {
-  if (STATE.peer) { try { STATE.peer.destroy(); } catch(e) {} STATE.peer = null; }
-
-  const isSecure    = location.protocol === 'https:';
-  const host        = location.hostname;
-  const defaultPort = isSecure ? 443 : 80;
-  const port        = location.port ? parseInt(location.port, 10) : defaultPort;
-
-  log('PeerJS connecting → ' + host + ':' + port, 'l-info');
-
-  const peer = new Peer(undefined, {
-    host, port, path: '/peerjs',
-    secure:       isSecure,
-    debug:        0,
-    pingInterval: 20000,
-    config:       ICE_CONFIG,
-  });
-
-  STATE.peer = peer;
-  STATE._peerRetries  = 0;
-  STATE._lastPeerErr  = null;
-
-  peer.on('open', id => {
-    STATE.myPeerId    = id;
-    STATE._peerRetries = 0;
-    STATE._lastPeerErr = null;
-    log('PeerJS ready ✓ ID: ' + id.slice(0, 8) + '…', 'l-ok');
-    $('statusDot').className = 'status-dot online';
-    setSignal(4);
-    if (onReady) onReady(id);
-  });
-
-  // Answer incoming calls
-  peer.on('call', call => {
-    log('Incoming call from ' + call.peer.slice(0, 8) + '…', 'l-info');
-    if (!STATE.localStream) { call.close(); return; }
-    call.answer(STATE.localStream);
-    handleCallStream(call);
-  });
-
-  peer.on('disconnected', () => {
-    if (!STATE.roomCode) return;
-    setSignal(2);
-    $('statusDot').className = 'status-dot error';
-    STATE._peerRetries++;
-    const delay = Math.min(1500 * STATE._peerRetries, 8000);
-    log('PeerJS disconnected — retry in ' + (delay / 1000) + 's…', 'l-err');
-    clearTimeout(STATE._peerRetryTimer);
-    STATE._peerRetryTimer = setTimeout(() => {
-      if (!STATE.roomCode) return;
-      try { if (peer.disconnected && !peer.destroyed) peer.reconnect(); }
-      catch(e) { initPeer(null); }
-    }, delay);
-  });
-
-  peer.on('error', err => {
-    if (!STATE.roomCode) return;
-    if (err.type !== STATE._lastPeerErr) {
-      log('PeerJS error: ' + err.type, 'l-err');
-      STATE._lastPeerErr = err.type;
-    }
-    const fatal = ['network', 'server-error', 'socket-error', 'socket-closed'];
-    if (fatal.includes(err.type)) {
-      setSignal(1);
-      STATE._peerRetries++;
-      const delay = Math.min(2000 * STATE._peerRetries, 12000);
-      clearTimeout(STATE._peerRetryTimer);
-      STATE._peerRetryTimer = setTimeout(() => {
-        if (STATE.roomCode) initPeer(null);
-      }, delay);
-    }
-  });
-}
-
-// Call another peer (outgoing)
-function callPeer(peerId) {
-  if (!STATE.localStream) { log('No mic stream — cannot call', 'l-err'); return; }
-  if (!STATE.peer)        { log('PeerJS not ready', 'l-err'); return; }
-  if (STATE.peers[peerId]?.call) { log('Already connected to ' + peerId.slice(0,8), 'l-muted'); return; }
-
-  log('Calling ' + (getRiderName(peerId) || peerId.slice(0, 8)) + '…', 'l-info');
-  try {
-    const call = STATE.peer.call(peerId, STATE.localStream, {
-      metadata: { name: STATE.myName },
-    });
-    if (!call) { log('Call returned null', 'l-err'); return; }
-    handleCallStream(call);
-  } catch(e) {
-    log('Call failed: ' + e.message, 'l-err');
-  }
-}
-
-// Handle audio stream from a call (works for both incoming & outgoing)
-function handleCallStream(call) {
-  const peerId = call.peer;
-
-  if (!STATE.peers[peerId]) STATE.peers[peerId] = {};
-  STATE.peers[peerId].call = call;
-
-  call.on('stream', remoteStream => {
-    const name = getRiderName(peerId) || call.metadata?.name || 'Rider';
-    log('🔊 Audio stream from ' + name + ' — playing…', 'l-ok');
-    toast('🔊 ' + name + ' audio connected!');
-
-    // Update name in UI if we have it from metadata
-    if (call.metadata?.name) updateRiderName(peerId, call.metadata.name);
-
-    const audioEl = playAudio(peerId, remoteStream);
-    STATE.peers[peerId].audioEl = audioEl;
-    setSignal(4);
-  });
-
-  call.on('close', () => {
-    const name = getRiderName(peerId) || 'Rider';
-    log(name + ' call closed', 'l-muted');
-    stopAudio(peerId);
-    if (STATE.peers[peerId]) delete STATE.peers[peerId].call;
-  });
-
-  call.on('error', e => {
-    log('Call error: ' + e.message, 'l-err');
-    stopAudio(peerId);
-    delete STATE.peers[peerId];
-  });
-}
-
-function cleanupPeer(peerId) {
-  const p = STATE.peers[peerId];
-  if (p) {
-    try { p.call?.close(); } catch(e) {}
-    stopAudio(peerId);
-  }
-  delete STATE.peers[peerId];
-}
-
-// ── UI helpers ────────────────────────────────────────────────────────────────
-function getRiderName(peerId) {
-  const el = document.getElementById('rname_' + peerId);
-  return el ? el.textContent : null;
-}
-
-function updateRiderName(peerId, name) {
-  const el = document.getElementById('rname_' + peerId);
-  if (el) el.textContent = name;
-}
-
-function addRiderUI(peerId, name) {
-  if ($('rider_' + peerId)) return;
+// ── Rider UI ──────────────────────────────────────────────────
+function addRiderUI(socketId, name) {
+  if ($('rider_' + socketId)) return;
   const list = $('ridersList');
   const div  = document.createElement('div');
   div.className = 'rider-item';
-  div.id = 'rider_' + peerId;
+  div.id = 'rider_' + socketId;
   div.innerHTML = `
-    <div class="rider-avatar">${(name || '?')[0].toUpperCase()}</div>
+    <div class="rider-avatar">${(name||'?')[0].toUpperCase()}</div>
     <div class="rider-info">
-      <div class="rider-name" id="rname_${peerId}">${name || 'Rider'}</div>
+      <div class="rider-name" id="rname_${socketId}">${name||'Rider'}</div>
       <div class="rider-status">● CONNECTED</div>
     </div>
     <div class="wave-bars"><span></span><span></span><span></span><span></span><span></span></div>
   `;
   list.appendChild(div);
-  updatePeerCount();
+  updateCount();
 }
 
-function removeRiderUI(peerId) {
-  const el = $('rider_' + peerId); if (el) el.remove();
-  updatePeerCount();
+function removeRiderUI(socketId) {
+  $('rider_' + socketId)?.remove();
+  updateCount();
 }
 
-function setRiderSpeaking(peerId, val) {
-  const el = $('rider_' + peerId);
-  if (el) el.classList.toggle('speaking', !!val);
+function setRiderSpeaking(socketId, val) {
+  $('rider_' + socketId)?.classList.toggle('speaking', !!val);
 }
 
-function updatePeerCount() {
-  const n = document.querySelectorAll('#ridersList .rider-item').length;
+function updateCount() {
+  const n = $('ridersList').querySelectorAll('.rider-item').length;
   $('peerCount').textContent = n + ' rider' + (n !== 1 ? 's' : '');
 }
 
-// ── Volume ────────────────────────────────────────────────────────────────────
+// ── Volume ────────────────────────────────────────────────────
 function setVolume(val) {
-  const pct = parseInt(val, 10);
-  STATE.volume = pct / 100;
+  const pct = parseInt(val);
+  volume = pct / 100;
   $('volVal').textContent = pct + '%';
-  Object.values(STATE.peers).forEach(p => {
-    if (p.audioEl) p.audioEl.volume = Math.min(STATE.volume * 2, 1);
+  Object.values(peers).forEach(p => {
+    if (p.audioEl) p.audioEl.volume = Math.min(volume * 2, 1);
   });
 }
 
-// ── PTT ───────────────────────────────────────────────────────────────────────
+// ── PTT ───────────────────────────────────────────────────────
 function startTalk(e) {
   if (e) e.preventDefault();
-  if (!STATE.localStream || STATE.isTalking) return;
-  STATE.isTalking = true;
+  if (!localStream || isTalking) return;
+  isTalking = true;
   muteMic(false);
   $('pttBtn').classList.add('active');
   $('pttLabel').textContent = 'TRANSMITTING…';
   $('pttRing').classList.add('active');
   $('myRider')?.classList.add('speaking');
-  wsSend({ type: 'speaking', value: true });
+  socket?.emit('speaking', { value: true });
 }
 
 function stopTalk(e) {
   if (e) e.preventDefault();
-  if (!STATE.isTalking) return;
-  STATE.isTalking = false;
+  if (!isTalking) return;
+  isTalking = false;
   muteMic(true);
   $('pttBtn').classList.remove('active');
   $('pttLabel').textContent = 'HOLD TO TALK';
   $('pttRing').classList.remove('active');
   $('myRider')?.classList.remove('speaking');
-  wsSend({ type: 'speaking', value: false });
+  socket?.emit('speaking', { value: false });
 }
 
-// Spacebar PTT on desktop
-document.addEventListener('keydown', e => { if (e.code === 'Space' && e.target.tagName !== 'INPUT') { e.preventDefault(); startTalk(); }});
-document.addEventListener('keyup',   e => { if (e.code === 'Space') stopTalk(); });
+document.addEventListener('keydown', e => { if (e.code==='Space' && e.target.tagName!=='INPUT') { e.preventDefault(); startTalk(); }});
+document.addEventListener('keyup',   e => { if (e.code==='Space') stopTalk(); });
 
-// ── Join / Leave ──────────────────────────────────────────────────────────────
+// ── Join / Leave ──────────────────────────────────────────────
 async function joinRoom() {
   const name = $('nameInput').value.trim();
   if (!name) { toast('Enter your name first'); return; }
 
-  let roomCode = $('roomInput').value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  let roomCode = $('roomInput').value.trim().toUpperCase().replace(/[^A-Z0-9]/g,'');
   if (!roomCode) roomCode = genCode();
 
-  STATE.myName   = name;
-  STATE.roomCode = roomCode;
+  myName = name;
+  myRoom = roomCode;
 
   const btn = $('joinBtn');
-  btn.disabled  = true;
-  btn.textContent = 'JOINING…';
+  btn.disabled = true; btn.textContent = 'JOINING…';
 
-  // 1. Request mic
+  // Get mic
   try {
-    STATE.localStream = await navigator.mediaDevices.getUserMedia({
+    localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation:         { ideal: true },
-        noiseSuppression:         { ideal: true },
-        autoGainControl:          { ideal: true },
-        googEchoCancellation:     true,   // Chrome
-        googAutoGainControl:      true,   // Chrome
-        googNoiseSuppression:     true,   // Chrome
-        googHighpassFilter:       true,   // Chrome
-        googEchoCancellation2:    true,   // Chrome enhanced
-        googNoiseSuppression2:    true,   // Chrome enhanced
-        sampleRate:       44100,
-        channelCount:     1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl:  true,
+        channelCount: 1,
       },
       video: false,
     });
     muteMic(true);
-    log('Microphone ready ✓', 'l-ok');
+    log('Mic ready ✓', 'l-ok');
   } catch(e) {
-    toast('Mic denied — check Settings > Safari/Chrome > Microphone');
+    toast('Mic denied — allow microphone access');
     btn.disabled = false; btn.textContent = 'JOIN';
     return;
   }
 
-  // 2. Switch screen
+  // Show room screen
   showScreen('screenRoom');
-  $('roomCodeDisplay').textContent  = roomCode;
-  $('headerSub').textContent        = 'Room ' + roomCode + ' · ' + name;
+  $('roomCodeDisplay').textContent = roomCode;
+  $('headerSub').textContent = 'Room ' + roomCode + ' · ' + name;
 
-  // 3. Add self to riders list
-  const list = $('ridersList'); list.innerHTML = '';
-  const self  = document.createElement('div');
-  self.className = 'rider-item';
-  self.id = 'myRider';
+  // Add self to list
+  $('ridersList').innerHTML = '';
+  const self = document.createElement('div');
+  self.className = 'rider-item'; self.id = 'myRider';
   self.innerHTML = `
     <div class="rider-avatar">${name[0].toUpperCase()}</div>
     <div class="rider-info">
@@ -480,96 +403,69 @@ async function joinRoom() {
     </div>
     <div class="wave-bars"><span></span><span></span><span></span><span></span><span></span></div>
   `;
-  list.appendChild(self);
-  updatePeerCount();
+  $('ridersList').appendChild(self);
+  updateCount();
 
-  // 4. Init PeerJS → on ready, connect Socket.IO
-  initPeer(peerId => {
-    log('Joining room ' + roomCode + ' as ' + name, 'l-ok');
-    connectSocket(roomCode, name, peerId);
-  });
-
+  // Connect
+  connectSocket(roomCode, name);
   btn.disabled = false; btn.textContent = 'JOIN';
 }
 
 function leaveRoom() {
-  STATE.roomCode = '';
-  STATE.myPeerId = '';
-  STATE.isTalking = false;
+  myRoom = ''; isTalking = false;
+  muteMic(true);
 
-  clearTimeout(STATE._peerRetryTimer);
-
-  // Disconnect socket
-  wsSend({ type: 'leave' });
-  if (_socket) { _socket.removeAllListeners(); try { _socket.disconnect(); } catch(e){} _socket = null; }
-
-  // Destroy peer
-  if (STATE.peer) { try { STATE.peer.destroy(); } catch(e){} STATE.peer = null; }
+  // Close all peer connections
+  Object.keys(peers).forEach(id => closePeer(id));
 
   // Stop mic
-  if (STATE.localStream) { STATE.localStream.getTracks().forEach(t => t.stop()); STATE.localStream = null; }
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
 
-  // Cleanup all audio
-  Object.keys(STATE.peers).forEach(id => cleanupPeer(id));
-  STATE.peers = {};
-  STATE._peerRetries = 0;
-  STATE._lastPeerErr = null;
+  // Disconnect socket
+  if (socket) { socket.removeAllListeners(); try { socket.disconnect(); } catch(e){} socket = null; }
 
   $('statusDot').className = 'status-dot';
-  $('headerSub').textContent = 'Helmet Intercom · Local WiFi';
+  $('headerSub').textContent = 'Helmet Intercom';
   setSignal(0);
   showScreen('screenJoin');
   $('ridersList').innerHTML = '';
   detectServer();
 }
 
-// ── QR Code ───────────────────────────────────────────────────────────────────
+// ── QR ────────────────────────────────────────────────────────
 async function showQR() {
-  const code = STATE.roomCode; if (!code) return;
-  const url  = location.protocol + '//' + location.host + '/?room=' + code;
+  if (!myRoom) return;
+  const url = location.origin + '/?room=' + myRoom;
   showScreen('screenQR');
-  $('qrRoomCode').textContent = code;
+  $('qrRoomCode').textContent = myRoom;
   $('qrUrl').textContent = url;
   try {
-    const res  = await fetch('/qr?url=' + encodeURIComponent(url));
-    const data = await res.json();
-    if (data.qr) $('qrImg').src = data.qr;
-  } catch(e) { $('qrUrl').textContent = 'Share manually: ' + url; }
+    const d = await (await fetch('/qr?url=' + encodeURIComponent(url))).json();
+    if (d.qr) $('qrImg').src = d.qr;
+  } catch(e) {}
 }
 
 function copyCode() {
-  const url = location.protocol + '//' + location.host + '/?room=' + STATE.roomCode;
-  navigator.clipboard.writeText(url)
-    .then(() => toast('Link copied! Share with riders 🏍️'))
-    .catch(() => toast('Code: ' + STATE.roomCode));
+  const url = location.origin + '/?room=' + myRoom;
+  navigator.clipboard.writeText(url).then(() => toast('Link copied! 🏍️')).catch(() => toast('Code: ' + myRoom));
 }
 
-// ── Server detect ─────────────────────────────────────────────────────────────
+// ── Server detect ─────────────────────────────────────────────
 async function detectServer() {
-  const statusEl = $('serverStatusText');
-  const dotEl    = document.querySelector('.server-status .dot');
+  const el  = $('serverStatusText');
+  const dot = document.querySelector('.server-status .dot');
   try {
-    const res  = await fetch('/health', { signal: AbortSignal.timeout(5000) });
-    if (res.ok) {
-      const data    = await res.json();
-      const isHttps = location.protocol === 'https:';
-      const onRail  = data.platform === 'railway';
-      statusEl.textContent = onRail
-        ? 'Railway server online ✅ · uptime ' + Math.floor(data.uptime) + 's'
-        : 'Local server · ' + (isHttps ? 'HTTPS ✅' : 'HTTP ⚠️');
-      dotEl.className = 'dot dot-ok';
-      const certNotice = $('certNotice');
-      if (certNotice) certNotice.style.display = (!onRail && isHttps) ? 'block' : 'none';
-      return true;
-    }
+    const d = await (await fetch('/health', { signal: AbortSignal.timeout(5000) })).json();
+    el.textContent  = (d.platform === 'railway' ? 'Railway ✅' : 'Local ✅') + ' · uptime ' + d.uptime + 's';
+    dot.className   = 'dot dot-ok';
+    const cn = $('certNotice');
+    if (cn) cn.style.display = (d.platform !== 'railway' && location.protocol === 'https:') ? 'block' : 'none';
   } catch(e) {
-    statusEl.textContent = 'Server not reachable';
-    dotEl.className = 'dot dot-err';
+    el.textContent  = 'Server not reachable';
+    dot.className   = 'dot dot-err';
   }
-  return false;
 }
 
-// ── Connection banner ─────────────────────────────────────────────────────────
 function showConnBanner(msg) {
   const b = $('connBanner'); if (!b) return;
   b.style.display = msg ? 'flex' : 'none';
@@ -577,40 +473,24 @@ function showConnBanner(msg) {
 }
 
 function retryConnection() {
-  if (!STATE.roomCode) return;
-  showConnBanner('Retrying…');
-  STATE._peerRetries = 0;
-  if (_socket?.connected) {
-    _socket.emit('join', { name: STATE.myName, roomCode: STATE.roomCode, peerId: STATE.myPeerId });
-  } else {
-    connectSocket(STATE.roomCode, STATE.myName, STATE.myPeerId);
-  }
+  if (socket?.connected) socket.emit('join', { name: myName, roomCode: myRoom });
+  else connectSocket(myRoom, myName);
 }
 
 window.setSignal = function(n) {
   const b = $('signalBars'); if (!b) return;
   b.className = 'signal-bars' + (n > 0 ? ' s' + n : '');
-  if (n <= 1 && STATE.roomCode) showConnBanner('Lost connection — retrying…');
+  if (n <= 1 && myRoom) showConnBanner('Lost connection — retrying…');
   else if (n >= 3) showConnBanner(null);
 };
 
-// ── URL param auto-fill ───────────────────────────────────────────────────────
-function checkUrlParams() {
-  const p = new URLSearchParams(location.search);
-  const r = p.get('room');
-  if (r) { $('roomInput').value = r.toUpperCase(); toast('Room code pre-filled!'); }
-}
-
-// ── Init ──────────────────────────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   detectServer();
-  checkUrlParams();
-
-  $('roomInput').addEventListener('input', e => {
-    e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
-  });
-  $('nameInput').addEventListener('keydown', e => { if (e.key === 'Enter') joinRoom(); });
-  $('roomInput').addEventListener('keydown', e => { if (e.key === 'Enter') joinRoom(); });
-
-  if ('wakeLock' in navigator) navigator.wakeLock.request('screen').catch(() => {});
+  const p = new URLSearchParams(location.search).get('room');
+  if (p) { $('roomInput').value = p.toUpperCase(); toast('Room pre-filled!'); }
+  $('roomInput').addEventListener('input', e => { e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,''); });
+  $('nameInput').addEventListener('keydown', e => { if (e.key==='Enter') joinRoom(); });
+  $('roomInput').addEventListener('keydown', e => { if (e.key==='Enter') joinRoom(); });
+  if ('wakeLock' in navigator) navigator.wakeLock.request('screen').catch(()=>{});
 });
