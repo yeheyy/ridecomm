@@ -14,12 +14,20 @@ const ICE = {
 
 // ── Globals ───────────────────────────────────────────
 let sock         = null;
-let myStream     = null;  // raw mic stream
+let myStream     = null;  // raw mic stream (from getUserMedia)
+let cleanStream  = null;  // processed stream (noise cancelled)
+let noiseCtx     = null;  // AudioContext for noise processing
 let myName       = '';
 let myRoom       = '';
 let talking      = false; // PTT active?
 let vol          = 1.0;
 const PCS        = {};    // PCS[socketId] = RTCPeerConnection
+
+// Noise cancellation settings
+let NC_ENABLED   = true;
+const NC_GATE    = -45;   // dB noise gate threshold
+const NC_RATIO   = 12;    // compression ratio
+const NC_KNEE    = 10;    // compression knee
 
 // ── 3 Modes ───────────────────────────────────────────
 // 0 = PTT  (hold button)
@@ -70,12 +78,108 @@ function setSig(n) {
 }
 
 function muteMic(yes) {
-  if (myStream) myStream.getAudioTracks().forEach(t => { t.enabled = !yes; });
+  // Mute both raw and clean stream tracks
+  if (myStream)    myStream.getAudioTracks().forEach(t => { t.enabled = !yes; });
+  if (cleanStream && cleanStream !== myStream)
+    cleanStream.getAudioTracks().forEach(t => { t.enabled = !yes; });
 }
 
 function rnd6() {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   return Array.from({length:6}, () => c[Math.floor(Math.random()*c.length)]).join('');
+}
+
+// ── Noise Cancellation Pipeline ───────────────────────
+// Raw mic → HighPass → LowPass → Compressor → Destination
+// Creates a clean processed stream for WebRTC
+async function buildCleanStream(rawStream) {
+  try {
+    // Clean up old context
+    if (noiseCtx) { try { noiseCtx.close(); } catch(e) {} noiseCtx = null; }
+
+    noiseCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    const src = noiseCtx.createMediaStreamSource(rawStream);
+
+    // ── 1. High-pass filter — removes low rumble/wind (below 80Hz)
+    const hpf = noiseCtx.createBiquadFilter();
+    hpf.type            = 'highpass';
+    hpf.frequency.value = 80;
+    hpf.Q.value         = 0.7;
+
+    // ── 2. Low-pass filter — removes high-frequency hiss (above 8000Hz)
+    const lpf = noiseCtx.createBiquadFilter();
+    lpf.type            = 'lowpass';
+    lpf.frequency.value = 8000;
+    lpf.Q.value         = 0.7;
+
+    // ── 3. Mid boost — boost voice frequencies (1000-3000Hz)
+    const mid = noiseCtx.createBiquadFilter();
+    mid.type            = 'peaking';
+    mid.frequency.value = 2000;
+    mid.gain.value      = 3;
+    mid.Q.value         = 0.8;
+
+    // ── 4. Dynamics Compressor — reduces loud peaks, lifts quiet voice
+    const comp = noiseCtx.createDynamicsCompressor();
+    comp.threshold.value = NC_GATE;   // -45dB gate
+    comp.knee.value      = NC_KNEE;   // 10dB knee
+    comp.ratio.value     = NC_RATIO;  // 12:1 ratio
+    comp.attack.value    = 0.003;     // 3ms attack
+    comp.release.value   = 0.25;      // 250ms release
+
+    // ── 5. Gain — slight boost after compression
+    const gain = noiseCtx.createGain();
+    gain.gain.value = 1.5;
+
+    // ── Connect chain ────────────────────────────────
+    // src → hpf → lpf → mid → comp → gain → destination
+    const dest = noiseCtx.createMediaStreamDestination();
+    src.connect(hpf);
+    hpf.connect(lpf);
+    lpf.connect(mid);
+    mid.connect(comp);
+    comp.connect(gain);
+    gain.connect(dest);
+
+    log('Noise cancellation ✓ (HPF+LPF+Comp)', 'l-ok');
+    return dest.stream;
+
+  } catch(e) {
+    log('NC failed, using raw stream: ' + e.message, 'l-err');
+    return rawStream; // fallback to raw
+  }
+}
+
+function toggleNoiseCancellation() {
+  NC_ENABLED = !NC_ENABLED;
+  const btn = $('ncBtn');
+
+  if (NC_ENABLED) {
+    if (btn) { btn.textContent = '🎚️ NC: ON'; btn.style.color = '#22c55e'; btn.style.borderColor = '#22c55e66'; }
+    log('Noise cancellation ON', 'l-ok');
+    toast('🎚️ Noise Cancellation ON');
+    // Rebuild clean stream if already in room
+    if (myStream) rebuildAudioChain();
+  } else {
+    if (btn) { btn.textContent = '🎚️ NC: OFF'; btn.style.color = 'var(--muted)'; btn.style.borderColor = 'rgba(255,255,255,0.1)'; }
+    log('Noise cancellation OFF', 'l-info');
+    toast('🎚️ Noise Cancellation OFF');
+    if (myStream) rebuildAudioChain();
+  }
+}
+
+async function rebuildAudioChain() {
+  if (!myStream) return;
+  // Rebuild clean stream
+  cleanStream = NC_ENABLED ? await buildCleanStream(myStream) : myStream;
+  // Replace tracks in all active peer connections
+  const newTrack = cleanStream.getAudioTracks()[0];
+  if (!newTrack) return;
+  Object.values(PCS).forEach(pc => {
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+    if (sender) sender.replaceTrack(newTrack).catch(() => {});
+  });
+  log('Audio chain rebuilt ✓', 'l-ok');
 }
 
 // ── Audio output ──────────────────────────────────────
@@ -109,7 +213,9 @@ function makePC(sid, rname) {
   const pc = new RTCPeerConnection(ICE);
   PCS[sid] = pc;
 
-  if (myStream) myStream.getTracks().forEach(t => pc.addTrack(t, myStream));
+  // Use noise-cancelled stream for WebRTC
+  const streamToUse = cleanStream || myStream;
+  if (streamToUse) streamToUse.getTracks().forEach(t => pc.addTrack(t, streamToUse));
 
   pc.ontrack = ev => {
     const s = ev.streams?.[0] || new MediaStream([ev.track]);
@@ -479,9 +585,15 @@ async function joinRoom() {
       },
       video: false,
     });
+    // Build noise-cancelled clean stream
+    if (NC_ENABLED) {
+      cleanStream = await buildCleanStream(myStream);
+    } else {
+      cleanStream = myStream;
+    }
     // Start muted (PTT default)
     muteMic(true);
-    log('Mic ready ✓', 'l-ok');
+    log('Mic ready ✓ (NC: ' + (NC_ENABLED ? 'ON' : 'OFF') + ')', 'l-ok');
   } catch(e) {
     toast('Mic denied — please allow microphone');
     myName = ''; myRoom = '';
@@ -527,6 +639,8 @@ function leaveRoom() {
     delete PCS[sid];
   });
 
+  if (noiseCtx)  { try { noiseCtx.close(); } catch(e) {} noiseCtx = null; }
+  cleanStream = null;
   if (myStream) { myStream.getTracks().forEach(t => t.stop()); myStream = null; }
   if (sock)     { sock.removeAllListeners(); try { sock.disconnect(); } catch(e) {} sock = null; }
 
