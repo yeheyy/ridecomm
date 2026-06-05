@@ -18,6 +18,7 @@ let myName      = '';
 let myRoom      = '';
 let talking     = false;
 let vol         = 1.0;
+let otherstalking = 0; // count of how many remote riders are speaking
 const PCS       = {};   // PCS[remoteSocketId] = RTCPeerConnection
 
 // ── tiny DOM helpers ──────────────────────────────────
@@ -60,7 +61,9 @@ function rnd6() {
 function playAudio(sid, stream) {
   let a=document.getElementById('A_'+sid);
   if(!a){ a=document.createElement('audio'); a.id='A_'+sid; document.body.appendChild(a); }
-  a.autoplay=true; a.playsInline=true; a.muted=false; a.volume=Math.min(vol*2,1);
+  a.autoplay=true; a.playsInline=true; a.muted=false;
+  // Keep volume at 100% max to reduce echo feedback loop
+  a.volume=Math.min(vol, 1.0);
   a.srcObject=stream;
   a.play().catch(()=>{
     const fn=()=>a.play().catch(()=>{});
@@ -231,6 +234,10 @@ function initSocket(){
   sock.on('speaking',({socketId,value})=>{
     const el=$('R_'+socketId);
     if(el) el.classList.toggle('speaking',!!value);
+    // Echo suppression: when remote rider speaks, track count
+    // This helps the browser AEC know when to suppress feedback
+    if(value) otherstalking++;
+    else otherstalking = Math.max(0, otherstalking - 1);
   });
 
   sock.on('disconnect',reason=>{
@@ -281,6 +288,7 @@ function setVolume(v){
 function startTalk(e){
   if(e) e.preventDefault();
   if(!myStream||talking) return;
+  if(talkMode !== 0) return; // only PTT mode uses hold button
   talking=true; mute(false);
   $('pttBtn').classList.add('active');
   $('pttLabel').textContent='TRANSMITTING…';
@@ -292,6 +300,7 @@ function startTalk(e){
 function stopTalk(e){
   if(e) e.preventDefault();
   if(!talking) return;
+  if(talkMode !== 0) return; // only PTT mode uses hold button
   talking=false; mute(true);
   $('pttBtn').classList.remove('active');
   $('pttLabel').textContent='HOLD TO TALK';
@@ -302,6 +311,150 @@ function stopTalk(e){
 
 document.addEventListener('keydown',e=>{if(e.code==='Space'&&e.target.tagName!=='INPUT'){e.preventDefault();startTalk();}});
 document.addEventListener('keyup',  e=>{if(e.code==='Space') stopTalk();});
+
+// ── Mode: PTT / VOX / OPEN MIC ───────────────────────
+// 0 = PTT (hold to talk)
+// 1 = VOX (voice activated — auto opens mic when speaking)
+// 2 = OPEN (always on)
+let talkMode = 0;
+let voxAnalyser  = null;
+let voxProcessor = null;
+let voxAudioCtx  = null;
+let voxActive    = false;  // is VOX currently transmitting?
+let voxSilTimer  = null;   // silence timer
+
+const MODES = [
+  { label: '🎙️ PUSH TO TALK', color: 'var(--orange)', hint: 'Hold button to transmit' },
+  { label: '🔊 VOX (AUTO)',    color: '#22c55e',        hint: 'Speak to transmit automatically' },
+  { label: '🔴 OPEN MIC',     color: '#ff4444',        hint: 'Always transmitting' },
+];
+
+function toggleMode(){
+  talkMode = (talkMode + 1) % 3;
+  applyMode();
+}
+
+function applyMode(){
+  const m   = MODES[talkMode];
+  const btn = $('modeBtn');
+  if(btn){ btn.textContent = m.label; btn.style.color = m.color; }
+  const hint = document.querySelector('.ptt-hint');
+  if(hint) hint.textContent = m.hint;
+
+  // Stop VOX if switching away
+  stopVOX();
+
+  if(talkMode === 0){
+    // PTT — mute mic, user holds button
+    if(!talking) mute(true);
+    $('pttBtn') && ($('pttBtn').style.opacity = '1');
+    $('pttBtn') && ($('pttBtn').style.pointerEvents = 'auto');
+    log('Mode: Push-to-Talk', 'l-info');
+    toast('PTT — hold button to speak');
+  }
+  else if(talkMode === 1){
+    // VOX — mic always listening, auto-transmit on voice
+    mute(false); // need to hear audio level
+    $('pttBtn') && ($('pttBtn').style.opacity = '0.4');
+    $('pttBtn') && ($('pttBtn').style.pointerEvents = 'none');
+    startVOX();
+    log('Mode: VOX (voice activated)', 'l-info');
+    toast('VOX — speak to transmit automatically!');
+  }
+  else if(talkMode === 2){
+    // Open mic — always transmitting
+    mute(false);
+    $('pttBtn') && ($('pttBtn').style.opacity = '0.4');
+    $('pttBtn') && ($('pttBtn').style.pointerEvents = 'none');
+    if(!talking){
+      talking = true;
+      $('pttBtn')?.classList.add('active');
+      $('pttLabel').textContent = 'OPEN MIC';
+      $('pttRing')?.classList.add('active');
+      $('myRider')?.classList.add('speaking');
+      sock?.emit('speaking', { value: true });
+    }
+    log('Mode: Open Mic (always on)', 'l-info');
+    toast('Open Mic — always transmitting!');
+  }
+}
+
+// ── VOX engine ────────────────────────────────────────
+const VOX_THRESHOLD = 20;   // 0-128 — sensitivity (lower = more sensitive)
+const VOX_HOLD_MS   = 1200; // ms to keep mic open after silence
+
+function startVOX(){
+  if(!myStream) return;
+  stopVOX(); // cleanup old
+
+  try{
+    voxAudioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+    const src    = voxAudioCtx.createMediaStreamSource(myStream);
+    voxAnalyser  = voxAudioCtx.createAnalyser();
+    voxAnalyser.fftSize = 512;
+    voxAnalyser.smoothingTimeConstant = 0.3;
+    src.connect(voxAnalyser);
+
+    const buf = new Uint8Array(voxAnalyser.frequencyBinCount);
+    let animId = null;
+
+    function checkVoice(){
+      if(talkMode !== 1){ stopVOX(); return; }
+      voxAnalyser.getByteFrequencyData(buf);
+
+      // Average energy in voice frequency range (300Hz-3000Hz)
+      let sum = 0;
+      const start = Math.floor(300  / (voxAudioCtx.sampleRate / voxAnalyser.fftSize));
+      const end   = Math.floor(3000 / (voxAudioCtx.sampleRate / voxAnalyser.fftSize));
+      for(let i = start; i < end && i < buf.length; i++) sum += buf[i];
+      const avg = sum / (end - start);
+
+      if(avg > VOX_THRESHOLD){
+        // VOICE DETECTED
+        clearTimeout(voxSilTimer);
+        if(!voxActive){
+          voxActive = true;
+          mute(false);
+          sock?.emit('speaking', { value: true });
+          $('pttBtn')?.classList.add('active');
+          $('pttLabel').textContent = 'SPEAKING…';
+          $('pttRing')?.classList.add('active');
+          $('myRider')?.classList.add('speaking');
+          log('VOX: voice detected — transmitting', 'l-muted');
+        }
+      } else {
+        // SILENCE — hold for VOX_HOLD_MS then close
+        if(voxActive && !voxSilTimer){
+          voxSilTimer = setTimeout(()=>{
+            voxActive = false;
+            voxSilTimer = null;
+            mute(true);
+            sock?.emit('speaking', { value: false });
+            $('pttBtn')?.classList.remove('active');
+            $('pttLabel').textContent = 'LISTENING…';
+            $('pttRing')?.classList.remove('active');
+            $('myRider')?.classList.remove('speaking');
+          }, VOX_HOLD_MS);
+        }
+      }
+      animId = requestAnimationFrame(checkVoice);
+    }
+    checkVoice();
+    voxProcessor = { stop: ()=>{ if(animId) cancelAnimationFrame(animId); } };
+    log('VOX engine started ✓', 'l-ok');
+  } catch(e){
+    log('VOX error: '+e.message, 'l-err');
+  }
+}
+
+function stopVOX(){
+  clearTimeout(voxSilTimer);
+  voxSilTimer = null;
+  voxActive   = false;
+  if(voxProcessor){ try{ voxProcessor.stop(); }catch(e){} voxProcessor = null; }
+  if(voxAudioCtx){  try{ voxAudioCtx.close();  }catch(e){} voxAudioCtx  = null; }
+  voxAnalyser = null;
+}
 
 // ── Join ──────────────────────────────────────────────
 async function joinRoom(){
@@ -317,7 +470,23 @@ async function joinRoom(){
 
   try{
     myStream=await navigator.mediaDevices.getUserMedia({
-      audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,channelCount:1},
+      audio:{
+        // Strong echo cancellation — reduces echo without earphones
+        echoCancellation:        {ideal:true},
+        noiseSuppression:        {ideal:true},
+        autoGainControl:         {ideal:true},
+        // Chrome-specific enhanced processing
+        googEchoCancellation:    true,
+        googEchoCancellation2:   true,
+        googNoiseSuppression:    true,
+        googNoiseSuppression2:   true,
+        googAutoGainControl:     true,
+        googAutoGainControl2:    true,
+        googHighpassFilter:      true,
+        googTypingNoiseDetection:true,
+        channelCount:            1,
+        sampleRate:              48000,
+      },
       video:false,
     });
     mute(true);
@@ -348,12 +517,17 @@ async function joinRoom(){
 
   initSocket();
 
+  // Apply current mode (default PTT)
+  applyMode();
+
   btn.disabled=false; btn.textContent='JOIN';
 }
 
 // ── Leave ─────────────────────────────────────────────
 function leaveRoom(){
   talking=false; myName=''; myRoom='';
+  talkMode=0; // reset to PTT on leave
+  stopVOX();
   mute(true);
   Object.keys(PCS).forEach(sid=>{try{PCS[sid].close();}catch(e){}killAudio(sid);delete PCS[sid];});
   if(myStream){myStream.getTracks().forEach(t=>t.stop());myStream=null;}
