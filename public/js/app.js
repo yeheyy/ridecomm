@@ -90,52 +90,64 @@ async function buildCleanStream(raw) {
     if (noiseCtx) { try { noiseCtx.close(); } catch(e){} noiseCtx = null; }
 
     noiseCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-    const src  = noiseCtx.createMediaStreamSource(raw);
+    const src = noiseCtx.createMediaStreamSource(raw);
 
-    // 1. High-pass — cut low rumble/wind below 80Hz
-    const hpf  = noiseCtx.createBiquadFilter();
-    hpf.type   = 'highpass';
-    hpf.frequency.value = 80;
-    hpf.Q.value = 0.7;
+    // Use the current NC strength profile
+    const p = NC_PROFILES[ncStrength] || NC_PROFILES[2];
 
-    // 2. Low-pass — cut hiss above 8kHz
-    const lpf  = noiseCtx.createBiquadFilter();
-    lpf.type   = 'lowpass';
-    lpf.frequency.value = 8000;
-    lpf.Q.value = 0.7;
+    // ── Stage 1: High-pass — removes wind/rumble ──────────────────────────
+    const hpf = noiseCtx.createBiquadFilter();
+    hpf.type            = 'highpass';
+    hpf.frequency.value = p.hpfFreq;
+    hpf.Q.value         = 0.5;
 
-    // 3. Presence boost — lift voice clarity (2kHz)
-    const mid  = noiseCtx.createBiquadFilter();
-    mid.type   = 'peaking';
-    mid.frequency.value = 2000;
-    mid.gain.value = 4;
-    mid.Q.value = 0.8;
+    // ── Stage 2: Low-pass — removes hiss ─────────────────────────────────
+    const lpf = noiseCtx.createBiquadFilter();
+    lpf.type            = 'lowpass';
+    lpf.frequency.value = p.lpfFreq;
+    lpf.Q.value         = 0.5;
 
-    // 4. Compressor — reduce loud bursts, lift quiet voice
+    // ── Stage 3: Notch at 1kHz — removes nasal/honky tone ────────────────
+    const notch = noiseCtx.createBiquadFilter();
+    notch.type            = 'peaking';
+    notch.frequency.value = 1000;
+    notch.gain.value      = p.notchGain;
+    notch.Q.value         = 1.5;
+
+    // ── Stage 4: Presence boost at 3kHz — voice clarity ──────────────────
+    const presence = noiseCtx.createBiquadFilter();
+    presence.type            = 'peaking';
+    presence.frequency.value = 3000;
+    presence.gain.value      = p.presenceGain;
+    presence.Q.value         = 1.2;
+
+    // ── Stage 5: Compressor — even volume, no clipping ───────────────────
     const comp = noiseCtx.createDynamicsCompressor();
-    comp.threshold.value = -45;
-    comp.knee.value      = 10;
-    comp.ratio.value     = 12;
-    comp.attack.value    = 0.003;
-    comp.release.value   = 0.25;
+    comp.threshold.value = p.compThresh;
+    comp.knee.value      = 8;
+    comp.ratio.value     = p.compRatio;
+    comp.attack.value    = p.compAttack;
+    comp.release.value   = p.compRelease;
 
-    // 5. Output gain
+    // ── Stage 6: Makeup gain ──────────────────────────────────────────────
     const gain = noiseCtx.createGain();
-    gain.gain.value = 1.4;
+    gain.gain.value = p.makeupGain;
 
-    // Chain: src → hpf → lpf → mid → comp → gain → dest
+    // src → hpf → lpf → notch → presence → comp → gain → dest
     const dest = noiseCtx.createMediaStreamDestination();
     src.connect(hpf);
     hpf.connect(lpf);
-    lpf.connect(mid);
-    mid.connect(comp);
+    lpf.connect(notch);
+    notch.connect(presence);
+    presence.connect(comp);
     comp.connect(gain);
     gain.connect(dest);
 
-    log('Noise cancellation pipeline ready ✓', 'l-ok');
+    log('NC [' + p.label + '] HPF=' + p.hpfFreq + 'Hz LPF=' + p.lpfFreq + 'Hz Comp=' + p.compRatio + ':1 ✓', 'l-ok');
     return dest.stream;
+
   } catch(e) {
-    log('NC fallback to raw: ' + e.message, 'l-err');
+    log('NC error — using raw stream: ' + e.message, 'l-err');
     return raw;
   }
 }
@@ -494,6 +506,32 @@ async function toggleNC() {
   }
 }
 
+// ── NC Strength levels ───────────────────────────────
+// 1 = Light (minimal processing — most natural sound)
+// 2 = Medium (balanced — default)
+// 3 = Strong (maximum noise removal)
+let ncStrength = 2;
+
+const NC_PROFILES = {
+  1: { hpfFreq: 80,  lpfFreq: 8000, notchGain: -1.5, presenceGain: 1.5, compThresh: -18, compRatio: 3,  compAttack: 0.015, compRelease: 0.2,  makeupGain: 1.0, label: 'LIGHT' },
+  2: { hpfFreq: 120, lpfFreq: 7000, notchGain: -3,   presenceGain: 2.5, compThresh: -24, compRatio: 4,  compAttack: 0.010, compRelease: 0.15, makeupGain: 1.0, label: 'MED'   },
+  3: { hpfFreq: 150, lpfFreq: 6000, notchGain: -4,   presenceGain: 3.5, compThresh: -30, compRatio: 6,  compAttack: 0.008, compRelease: 0.12, makeupGain: 1.0, label: 'STRONG'},
+};
+
+async function setNCStrength(val) {
+  ncStrength = parseInt(val);
+  const p = NC_PROFILES[ncStrength];
+  const lbl = $('ncStrengthLabel');
+  if (lbl) lbl.textContent = p.label;
+  log('NC strength: ' + p.label, 'l-info');
+  // Rebuild if NC is active
+  if (ncOn && myStream) {
+    cleanStream = await buildCleanStream(myStream);
+    await replaceTrack();
+    toast('🎚️ NC: ' + p.label);
+  }
+}
+
 async function replaceTrack() {
   const s     = cleanStream || myStream;
   const track = s?.getAudioTracks()[0];
@@ -554,22 +592,42 @@ async function joinRoom() {
 
   // Get microphone
   try {
-    myStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation:      { ideal: true },
-        noiseSuppression:      { ideal: true },
-        autoGainControl:       { ideal: true },
-        googEchoCancellation:  true,
-        googEchoCancellation2: true,
-        googNoiseSuppression:  true,
-        googNoiseSuppression2: true,
-        googAutoGainControl:   true,
-        googHighpassFilter:    true,
-        channelCount:          1,
-        sampleRate:            48000,
-      },
-      video: false,
-    });
+    // First try with all constraints, fall back if browser rejects
+    const audioConstraints = {
+      // Browser built-in processing (hardware level — most effective)
+      echoCancellation:         { ideal: true },
+      noiseSuppression:         { ideal: true },
+      autoGainControl:          { ideal: true },
+      // Chrome/Edge enhanced processing flags
+      googEchoCancellation:     true,
+      googEchoCancellation2:    true,
+      googNoiseSuppression:     true,
+      googNoiseSuppression2:    true,
+      googAutoGainControl:      true,
+      googAutoGainControl2:     true,
+      googHighpassFilter:       true,
+      googTypingNoiseDetection: true,
+      googAudioMirroring:       false,
+      // Audio quality
+      channelCount:             1,      // mono — reduces background bleed
+      sampleRate:               48000,  // 48kHz — standard for voice
+      sampleSize:               16,
+    };
+
+    try {
+      myStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+    } catch(e1) {
+      // Some browsers reject unknown constraints — try basic fallback
+      log('Trying basic mic constraints...', 'l-info');
+      try {
+        myStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false,
+        });
+      } catch(e2) {
+        throw e2; // re-throw to outer catch
+      }
+    }
 
     // Build noise-cancelled stream
     cleanStream = ncOn ? await buildCleanStream(myStream) : myStream;
