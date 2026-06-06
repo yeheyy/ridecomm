@@ -132,38 +132,40 @@
       </div>
     </div>
 
-    <!-- PTT -->
+    <!-- Mic Control -->
     <div class="ptt-area">
+
+      <!-- Big tap-to-mute/unmute button -->
       <div class="ptt-ring" id="pttRing">
-        <button class="ptt-btn" id="pttBtn"
-          onmousedown="startTalk()" onmouseup="stopTalk()" onmouseleave="stopTalk()"
-          ontouchstart="startTalk(event)" ontouchend="stopTalk(event)" ontouchcancel="stopTalk(event)">
-          <div class="mic-emoji">🎙️</div>
-          <div class="ptt-label" id="pttLabel">HOLD TO TALK</div>
+        <button class="ptt-btn" id="micBtn" onclick="toggleMic()">
+          <div class="mic-emoji" id="micIcon">🔇</div>
+          <div class="ptt-label" id="micLabel">TAP TO SPEAK</div>
         </button>
       </div>
-      <div class="ptt-hint">Hold to transmit · release to stop</div>
-      <div style="display:flex;flex-direction:column;align-items:center;gap:8px;margin-top:14px;">
-        <button id="modeBtn" onclick="toggleMode()" style="
+
+      <div class="ptt-hint">Tap to unmute · tap again to mute</div>
+
+      <!-- VOX + NC toggle buttons -->
+      <div style="display:flex;gap:10px;margin-top:14px;justify-content:center;flex-wrap:wrap;">
+        <button id="voxBtn" onclick="toggleVOX()" style="
           background:#141820;
-          border:1.5px solid rgba(255,149,0,0.35);
+          border:1.5px solid rgba(255,255,255,0.08);
           border-radius:24px;
-          padding:8px 22px;
+          padding:7px 18px;
           font-family:'Rajdhani',sans-serif;
-          font-size:13px;
+          font-size:12px;
           font-weight:700;
           letter-spacing:1.5px;
-          color:#ff9500;
+          color:var(--muted);
           cursor:pointer;
           transition:all 0.2s;
-          min-width:180px;
-          text-align:center;
-        ">🎙️ PUSH TO TALK</button>
-        <button id="ncBtn" onclick="toggleNoiseCancellation()" style="
+        ">🔊 VOX: OFF</button>
+
+        <button id="ncBtn" onclick="toggleNC()" style="
           background:#141820;
-          border:1.5px solid rgba(34,197,94,0.35);
+          border:1.5px solid rgba(34,197,94,0.4);
           border-radius:24px;
-          padding:6px 18px;
+          padding:7px 18px;
           font-family:'Rajdhani',sans-serif;
           font-size:12px;
           font-weight:700;
@@ -171,10 +173,11 @@
           color:#22c55e;
           cursor:pointer;
           transition:all 0.2s;
-          min-width:180px;
-          text-align:center;
         ">🎚️ NC: ON</button>
-        <div style="font-size:10px;color:#3a4252;font-family:'Rajdhani',sans-serif;letter-spacing:1px;">TAP TO CHANGE MODE · TAP NC TO TOGGLE</div>
+      </div>
+
+      <div style="font-size:10px;color:#3a4252;font-family:'Rajdhani',sans-serif;letter-spacing:1px;margin-top:8px;text-align:center;">
+        VOX = auto-speak · NC = noise cancel
       </div>
     </div>
 
