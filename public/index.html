@@ -179,6 +179,16 @@
       <div style="font-size:10px;color:#3a4252;font-family:'Rajdhani',sans-serif;letter-spacing:1px;margin-top:8px;text-align:center;">
         VOX = auto-speak · NC = noise cancel
       </div>
+
+      <!-- NC Strength slider -->
+      <div id="ncSliderWrap" style="width:100%;padding:10px 24px 0;box-sizing:border-box;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span style="font-size:10px;color:#555e70;font-family:'Rajdhani',sans-serif;letter-spacing:1px;white-space:nowrap;">NC LEVEL</span>
+          <input type="range" id="ncSlider" min="1" max="3" value="2" step="1"
+            class="vol-slider" oninput="setNCStrength(this.value)" style="flex:1;">
+          <span id="ncStrengthLabel" style="font-size:10px;color:#22c55e;font-family:'Rajdhani',sans-serif;letter-spacing:1px;min-width:44px;text-align:right;">MED</span>
+        </div>
+      </div>
     </div>
 
     <!-- Log -->
