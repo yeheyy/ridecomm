@@ -1,6 +1,6 @@
 'use strict';
 // RideComm — WebRTC + Socket.IO
-// Mic: tap to mute/unmute | VOX: voice activated | NC: noise cancel
+// Clean audio — browser native processing only, no Web Audio pipeline
 
 // ── ICE/TURN ──────────────────────────────────────────
 const ICE = {
@@ -14,29 +14,24 @@ const ICE = {
 };
 
 // ── State ─────────────────────────────────────────────
-let sock        = null;
-let myStream    = null;   // raw mic stream
-let cleanStream = null;   // noise-cancelled stream
-let noiseCtx    = null;
-let myName      = '';
-let myRoom      = '';
-let isMuted     = true;   // mic starts muted
-let vol         = 1.0;
-const PCS       = {};     // PCS[socketId] = RTCPeerConnection
+let sock     = null;
+let myStream = null;   // mic stream
+let myName   = '';
+let myRoom   = '';
+let isMuted  = true;   // starts muted
+let vol      = 1.0;
+const PCS    = {};     // PCS[socketId] = RTCPeerConnection
 
 // VOX
-let voxOn       = false;
-let voxCtx      = null;
-let voxRaf      = null;
-let voxActive   = false;
-let voxTimer    = null;
-const VOX_DB    = 18;     // sensitivity threshold
-const VOX_HOLD  = 1500;   // ms to stay open after silence
+let voxOn     = false;
+let voxCtx    = null;
+let voxRaf    = null;
+let voxActive = false;
+let voxTimer  = null;
+const VOX_DB  = 15;    // voice detection threshold (0-255)
+const VOX_HOLD = 1500; // ms to stay open after silence
 
-// Noise cancel
-let ncOn        = true;
-
-// ── DOM helpers ───────────────────────────────────────
+// ── DOM ───────────────────────────────────────────────
 const $  = id => document.getElementById(id);
 const qs = s  => document.querySelector(s);
 
@@ -57,8 +52,10 @@ function toast(msg) {
 function log(msg, cls = 'l-muted') {
   const b = $('logBox');
   if (!b) return;
-  const ts = new Date().toLocaleTimeString('en',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  const p  = document.createElement('p');
+  const ts = new Date().toLocaleTimeString('en', {
+    hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const p = document.createElement('p');
   p.className   = cls;
   p.textContent = '[' + ts + '] ' + msg;
   b.appendChild(p);
@@ -72,92 +69,21 @@ function setSig(n) {
 
 function genCode() {
   const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  return Array.from({length:6}, () => c[Math.floor(Math.random()*c.length)]).join('');
+  return Array.from({length: 6}, () => c[Math.floor(Math.random() * c.length)]).join('');
 }
 
-// ── Mic mute/unmute ───────────────────────────────────
-function setMicEnabled(enabled) {
-  // Enable/disable tracks on BOTH raw and clean stream
+// ── Mic enable/disable ────────────────────────────────
+function setMic(enabled) {
   if (myStream)
     myStream.getAudioTracks().forEach(t => { t.enabled = enabled; });
-  if (cleanStream && cleanStream !== myStream)
-    cleanStream.getAudioTracks().forEach(t => { t.enabled = enabled; });
-}
-
-// ── Noise Cancellation pipeline ───────────────────────
-async function buildCleanStream(raw) {
-  try {
-    if (noiseCtx) { try { noiseCtx.close(); } catch(e){} noiseCtx = null; }
-
-    noiseCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-    const src = noiseCtx.createMediaStreamSource(raw);
-
-    // Use the current NC strength profile
-    const p = NC_PROFILES[ncStrength] || NC_PROFILES[2];
-
-    // ── Stage 1: High-pass — removes wind/rumble ──────────────────────────
-    const hpf = noiseCtx.createBiquadFilter();
-    hpf.type            = 'highpass';
-    hpf.frequency.value = p.hpfFreq;
-    hpf.Q.value         = 0.5;
-
-    // ── Stage 2: Low-pass — removes hiss ─────────────────────────────────
-    const lpf = noiseCtx.createBiquadFilter();
-    lpf.type            = 'lowpass';
-    lpf.frequency.value = p.lpfFreq;
-    lpf.Q.value         = 0.5;
-
-    // ── Stage 3: Notch at 1kHz — removes nasal/honky tone ────────────────
-    const notch = noiseCtx.createBiquadFilter();
-    notch.type            = 'peaking';
-    notch.frequency.value = 1000;
-    notch.gain.value      = p.notchGain;
-    notch.Q.value         = 1.5;
-
-    // ── Stage 4: Presence boost at 3kHz — voice clarity ──────────────────
-    const presence = noiseCtx.createBiquadFilter();
-    presence.type            = 'peaking';
-    presence.frequency.value = 3000;
-    presence.gain.value      = p.presenceGain;
-    presence.Q.value         = 1.2;
-
-    // ── Stage 5: Compressor — even volume, no clipping ───────────────────
-    const comp = noiseCtx.createDynamicsCompressor();
-    comp.threshold.value = p.compThresh;
-    comp.knee.value      = 8;
-    comp.ratio.value     = p.compRatio;
-    comp.attack.value    = p.compAttack;
-    comp.release.value   = p.compRelease;
-
-    // ── Stage 6: Makeup gain ──────────────────────────────────────────────
-    const gain = noiseCtx.createGain();
-    gain.gain.value = p.makeupGain;
-
-    // src → hpf → lpf → notch → presence → comp → gain → dest
-    const dest = noiseCtx.createMediaStreamDestination();
-    src.connect(hpf);
-    hpf.connect(lpf);
-    lpf.connect(notch);
-    notch.connect(presence);
-    presence.connect(comp);
-    comp.connect(gain);
-    gain.connect(dest);
-
-    log('NC [' + p.label + '] HPF=' + p.hpfFreq + 'Hz LPF=' + p.lpfFreq + 'Hz Comp=' + p.compRatio + ':1 ✓', 'l-ok');
-    return dest.stream;
-
-  } catch(e) {
-    log('NC error — using raw stream: ' + e.message, 'l-err');
-    return raw;
-  }
 }
 
 // ── Audio output ──────────────────────────────────────
 function playAudio(sid, stream) {
   let a = document.getElementById('AUD_' + sid);
   if (!a) {
-    a             = document.createElement('audio');
-    a.id          = 'AUD_' + sid;
+    a = document.createElement('audio');
+    a.id = 'AUD_' + sid;
     document.body.appendChild(a);
   }
   a.autoplay    = true;
@@ -181,13 +107,13 @@ function killAudio(sid) {
 function makePC(sid, rname) {
   if (PCS[sid]) { try { PCS[sid].close(); } catch(e){} delete PCS[sid]; }
 
-  const pc       = new RTCPeerConnection(ICE);
-  PCS[sid]       = pc;
+  const pc = new RTCPeerConnection(ICE);
+  PCS[sid] = pc;
 
-  // Use noise-cancelled stream for sending
-  const tx = cleanStream || myStream;
-  if (tx) tx.getTracks().forEach(t => pc.addTrack(t, tx));
+  // Add mic tracks to this connection
+  if (myStream) myStream.getTracks().forEach(t => pc.addTrack(t, myStream));
 
+  // Receive remote audio
   pc.ontrack = ev => {
     const s = ev.streams?.[0] || new MediaStream([ev.track]);
     log('🔊 Audio from ' + rname + ' ✓', 'l-ok');
@@ -196,6 +122,7 @@ function makePC(sid, rname) {
     setSig(4);
   };
 
+  // Send ICE candidates
   pc.onicecandidate = ev => {
     if (ev.candidate && sock)
       sock.emit('ice-candidate', { to: sid, candidate: ev.candidate.toJSON() });
@@ -254,13 +181,17 @@ function initSocket() {
   if (sock) { sock.removeAllListeners(); try { sock.disconnect(); } catch(e){} sock = null; }
 
   sock = io(window.location.origin, {
-    transports: ['polling', 'websocket'], upgrade: true,
-    reconnection: true, reconnectionDelay: 1000,
-    reconnectionDelayMax: 5000, timeout: 20000, forceNew: true,
+    transports:           ['polling', 'websocket'],
+    upgrade:              true,
+    reconnection:         true,
+    reconnectionDelay:    1000,
+    reconnectionDelayMax: 5000,
+    timeout:              20000,
+    forceNew:             true,
   });
 
   sock.on('connect', () => {
-    log('Server connected ✓ (' + sock.io.engine.transport.name + ')', 'l-ok');
+    log('Connected ✓ (' + sock.io.engine.transport.name + ')', 'l-ok');
     setSig(4);
     $('statusDot').className = 'status-dot online';
     showBanner(null);
@@ -301,21 +232,20 @@ function initSocket() {
     if (myRoom) showBanner('Reconnecting...');
   });
 
-  sock.on('connect_error', err => { log('Connect error: ' + err.message, 'l-err'); setSig(1); });
+  sock.on('connect_error', err => { log('Error: ' + err.message, 'l-err'); setSig(1); });
 }
 
 // ══════════════════════════════════════════════════════
-//  MIC CONTROL — tap to mute / unmute
+//  MIC — tap to mute / unmute
 // ══════════════════════════════════════════════════════
 
 function toggleMic() {
-  if (voxOn) return; // VOX mode handles mic automatically
-
+  if (voxOn) return; // VOX handles mic
   isMuted = !isMuted;
-  setMicEnabled(!isMuted);
+  setMic(!isMuted);
   updateMicUI();
   sock?.emit('speaking', { value: !isMuted });
-  log(isMuted ? '🔇 Muted' : '🎙️ Unmuted — speaking', 'l-info');
+  log(isMuted ? '🔇 Muted' : '🎙️ Speaking', 'l-info');
 }
 
 function updateMicUI() {
@@ -323,26 +253,21 @@ function updateMicUI() {
   const icon  = $('micIcon');
   const label = $('micLabel');
   const ring  = $('pttRing');
-  const meEl  = $('myRider');
+  const me    = $('myRider');
 
   if (isMuted) {
-    // ── MUTED ────────────────────────────────────────
     if (icon)  icon.textContent  = '🔇';
     if (label) label.textContent = 'TAP TO SPEAK';
     btn?.classList.remove('active');
     ring?.classList.remove('active');
-    meEl?.classList.remove('speaking');
-    if (btn) {
-      btn.style.background  = '';
-      btn.style.borderColor = '';
-    }
+    me?.classList.remove('speaking');
+    if (btn) { btn.style.background = ''; btn.style.borderColor = ''; }
   } else {
-    // ── UNMUTED / SPEAKING ───────────────────────────
     if (icon)  icon.textContent  = '🎙️';
     if (label) label.textContent = 'TAP TO MUTE';
     btn?.classList.add('active');
     ring?.classList.add('active');
-    meEl?.classList.add('speaking');
+    me?.classList.add('speaking');
     if (btn) {
       btn.style.background  = 'rgba(255,149,0,0.12)';
       btn.style.borderColor = 'var(--orange)';
@@ -351,7 +276,7 @@ function updateMicUI() {
 }
 
 // ══════════════════════════════════════════════════════
-//  VOX — voice activated auto mute/unmute
+//  VOX — voice activated auto speak
 // ══════════════════════════════════════════════════════
 
 function toggleVOX() {
@@ -359,38 +284,25 @@ function toggleVOX() {
   const btn = $('voxBtn');
 
   if (voxOn) {
-    // Start VOX
-    if (btn) {
-      btn.textContent   = '🔊 VOX: ON';
-      btn.style.color   = '#22c55e';
-      btn.style.borderColor = 'rgba(34,197,94,0.5)';
-    }
-    // Disable the manual mic button
+    if (btn) { btn.textContent = '🔊 VOX: ON'; btn.style.color = '#22c55e'; btn.style.borderColor = 'rgba(34,197,94,0.5)'; }
     const mb = $('micBtn');
     if (mb) { mb.style.opacity = '0.35'; mb.style.pointerEvents = 'none'; }
-
-    // Start mic enabled so analyser can detect voice
-    isMuted = false;
-    setMicEnabled(true);
+    // Unmute so analyser can hear
+    isMuted = true;
+    setMic(true); // keep enabled so VOX analyser works
     startVOX();
-    log('VOX ON — speak to transmit automatically', 'l-ok');
-    toast('🔊 VOX ON — just speak naturally!');
+    log('VOX ON — speak to transmit', 'l-ok');
+    toast('🔊 VOX ON — just speak!');
   } else {
-    // Stop VOX
-    if (btn) {
-      btn.textContent   = '🔊 VOX: OFF';
-      btn.style.color   = 'var(--muted)';
-      btn.style.borderColor = 'rgba(255,255,255,0.08)';
-    }
+    if (btn) { btn.textContent = '🔊 VOX: OFF'; btn.style.color = 'var(--muted)'; btn.style.borderColor = 'rgba(255,255,255,0.08)'; }
     stopVOX();
-    // Re-enable manual button, reset to muted
     const mb = $('micBtn');
     if (mb) { mb.style.opacity = '1'; mb.style.pointerEvents = 'auto'; }
     isMuted = true;
-    setMicEnabled(false);
+    setMic(false);
     updateMicUI();
     sock?.emit('speaking', { value: false });
-    log('VOX OFF — tap button to speak', 'l-info');
+    log('VOX OFF', 'l-info');
     toast('VOX OFF');
   }
 }
@@ -403,69 +315,52 @@ function startVOX() {
     voxCtx = new (window.AudioContext || window.webkitAudioContext)();
     const src  = voxCtx.createMediaStreamSource(myStream);
     const anlz = voxCtx.createAnalyser();
-    anlz.fftSize              = 512;
-    anlz.smoothingTimeConstant = 0.4;
+    anlz.fftSize               = 512;
+    anlz.smoothingTimeConstant = 0.3;
     src.connect(anlz);
 
     const buf   = new Uint8Array(anlz.frequencyBinCount);
     const binsz = voxCtx.sampleRate / anlz.fftSize;
-    const lo    = Math.floor(200  / binsz);   // 200 Hz
-    const hi    = Math.floor(4000 / binsz);   // 4000 Hz
+    const lo    = Math.floor(200  / binsz);
+    const hi    = Math.floor(4000 / binsz);
 
     function tick() {
       if (!voxOn) { stopVOX(); return; }
 
       anlz.getByteFrequencyData(buf);
       let sum = 0;
-      const len = Math.min(hi, buf.length);
-      for (let i = lo; i < len; i++) sum += buf[i];
-      const avg = sum / (len - lo);
+      const end = Math.min(hi, buf.length);
+      for (let i = lo; i < end; i++) sum += buf[i];
+      const avg = sum / (end - lo);
 
       if (avg >= VOX_DB) {
-        // ── Voice detected ─────────────────────────
-        clearTimeout(voxTimer);
-        voxTimer = null;
-
+        clearTimeout(voxTimer); voxTimer = null;
         if (!voxActive) {
           voxActive = true;
-          isMuted   = false;
-          setMicEnabled(true);
+          setMic(true);
           sock?.emit('speaking', { value: true });
-
-          const icon  = $('micIcon');
-          const label = $('micLabel');
-          const ring  = $('pttRing');
           $('micBtn')?.classList.add('active');
+          $('pttRing')?.classList.add('active');
           $('myRider')?.classList.add('speaking');
-          ring?.classList.add('active');
-          if (icon)  icon.textContent  = '🎙️';
-          if (label) label.textContent = 'SPEAKING…';
+          const icon  = $('micIcon');  if (icon)  icon.textContent  = '🎙️';
+          const label = $('micLabel'); if (label) label.textContent = 'SPEAKING…';
         }
       } else {
-        // ── Silence ────────────────────────────────
         if (voxActive && !voxTimer) {
           voxTimer = setTimeout(() => {
-            voxActive = false;
-            voxTimer  = null;
-            isMuted   = true;
-            setMicEnabled(false);
+            voxActive = false; voxTimer = null;
+            setMic(false);
             sock?.emit('speaking', { value: false });
-
-            const icon  = $('micIcon');
-            const label = $('micLabel');
-            const ring  = $('pttRing');
             $('micBtn')?.classList.remove('active');
+            $('pttRing')?.classList.remove('active');
             $('myRider')?.classList.remove('speaking');
-            ring?.classList.remove('active');
-            if (icon)  icon.textContent  = '🔇';
-            if (label) label.textContent = 'LISTENING…';
+            const icon  = $('micIcon');  if (icon)  icon.textContent  = '🔇';
+            const label = $('micLabel'); if (label) label.textContent = 'LISTENING…';
           }, VOX_HOLD);
         }
       }
-
       voxRaf = requestAnimationFrame(tick);
     }
-
     tick();
     log('VOX engine running ✓', 'l-ok');
   } catch(e) {
@@ -479,67 +374,6 @@ function stopVOX() {
   if (voxTimer) { clearTimeout(voxTimer);       voxTimer = null; }
   if (voxCtx)   { try { voxCtx.close(); } catch(e){} voxCtx = null; }
   voxActive = false;
-}
-
-// ══════════════════════════════════════════════════════
-//  NC — noise cancellation toggle
-// ══════════════════════════════════════════════════════
-
-async function toggleNC() {
-  ncOn = !ncOn;
-  const btn = $('ncBtn');
-
-  if (ncOn) {
-    if (btn) { btn.textContent = '🎚️ NC: ON'; btn.style.color = '#22c55e'; btn.style.borderColor = 'rgba(34,197,94,0.4)'; }
-    if (myStream) {
-      cleanStream = await buildCleanStream(myStream);
-      await replaceTrack();
-    }
-    toast('🎚️ Noise Cancellation ON');
-    log('NC: ON', 'l-ok');
-  } else {
-    if (btn) { btn.textContent = '🎚️ NC: OFF'; btn.style.color = 'var(--muted)'; btn.style.borderColor = 'rgba(255,255,255,0.08)'; }
-    cleanStream = myStream;
-    await replaceTrack();
-    toast('🎚️ Noise Cancellation OFF');
-    log('NC: OFF', 'l-info');
-  }
-}
-
-// ── NC Strength levels ───────────────────────────────
-// 1 = Light (minimal processing — most natural sound)
-// 2 = Medium (balanced — default)
-// 3 = Strong (maximum noise removal)
-let ncStrength = 2;
-
-const NC_PROFILES = {
-  1: { hpfFreq: 80,  lpfFreq: 8000, notchGain: -1.5, presenceGain: 1.5, compThresh: -18, compRatio: 3,  compAttack: 0.015, compRelease: 0.2,  makeupGain: 1.0, label: 'LIGHT' },
-  2: { hpfFreq: 120, lpfFreq: 7000, notchGain: -3,   presenceGain: 2.5, compThresh: -24, compRatio: 4,  compAttack: 0.010, compRelease: 0.15, makeupGain: 1.0, label: 'MED'   },
-  3: { hpfFreq: 150, lpfFreq: 6000, notchGain: -4,   presenceGain: 3.5, compThresh: -30, compRatio: 6,  compAttack: 0.008, compRelease: 0.12, makeupGain: 1.0, label: 'STRONG'},
-};
-
-async function setNCStrength(val) {
-  ncStrength = parseInt(val);
-  const p = NC_PROFILES[ncStrength];
-  const lbl = $('ncStrengthLabel');
-  if (lbl) lbl.textContent = p.label;
-  log('NC strength: ' + p.label, 'l-info');
-  // Rebuild if NC is active
-  if (ncOn && myStream) {
-    cleanStream = await buildCleanStream(myStream);
-    await replaceTrack();
-    toast('🎚️ NC: ' + p.label);
-  }
-}
-
-async function replaceTrack() {
-  const s     = cleanStream || myStream;
-  const track = s?.getAudioTracks()[0];
-  if (!track) return;
-  for (const pc of Object.values(PCS)) {
-    const sender = pc.getSenders().find(s => s.track?.kind === 'audio');
-    if (sender) await sender.replaceTrack(track).catch(() => {});
-  }
 }
 
 // ── Rider UI ──────────────────────────────────────────
@@ -557,7 +391,7 @@ function addUI(sid, name) {
     '<div class="wave-bars"><span></span><span></span><span></span><span></span><span></span></div>';
   $('ridersList').appendChild(d);
   updCnt();
-  log(name + ' added to room ✓', 'l-ok');
+  log(name + ' added ✓', 'l-ok');
 }
 
 function removeUI(sid) { $('R_' + sid)?.remove(); updCnt(); }
@@ -575,7 +409,7 @@ function setVolume(v) {
   document.querySelectorAll('audio[id^="AUD_"]').forEach(a => { a.volume = Math.min(vol, 1); });
 }
 
-// ── Join room ─────────────────────────────────────────
+// ── Join ──────────────────────────────────────────────
 async function joinRoom() {
   const name = ($('nameInput').value || '').trim();
   if (!name) { toast('Enter your name first'); return; }
@@ -590,52 +424,26 @@ async function joinRoom() {
   btn.disabled    = true;
   btn.textContent = 'JOINING…';
 
-  // Get microphone
+  // Get mic — let the browser handle all processing natively
+  // Browser echo cancellation + noise suppression is the best available
   try {
-    // First try with all constraints, fall back if browser rejects
-    const audioConstraints = {
-      // Browser built-in processing (hardware level — most effective)
-      echoCancellation:         { ideal: true },
-      noiseSuppression:         { ideal: true },
-      autoGainControl:          { ideal: true },
-      // Chrome/Edge enhanced processing flags
-      googEchoCancellation:     true,
-      googEchoCancellation2:    true,
-      googNoiseSuppression:     true,
-      googNoiseSuppression2:    true,
-      googAutoGainControl:      true,
-      googAutoGainControl2:     true,
-      googHighpassFilter:       true,
-      googTypingNoiseDetection: true,
-      googAudioMirroring:       false,
-      // Audio quality
-      channelCount:             1,      // mono — reduces background bleed
-      sampleRate:               48000,  // 48kHz — standard for voice
-      sampleSize:               16,
-    };
-
-    try {
-      myStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
-    } catch(e1) {
-      // Some browsers reject unknown constraints — try basic fallback
-      log('Trying basic mic constraints...', 'l-info');
-      try {
-        myStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          video: false,
-        });
-      } catch(e2) {
-        throw e2; // re-throw to outer catch
-      }
-    }
-
-    // Build noise-cancelled stream
-    cleanStream = ncOn ? await buildCleanStream(myStream) : myStream;
+    myStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // ── Browser native processing — handles everything cleanly ──────
+        echoCancellation: true,   // removes speaker echo
+        noiseSuppression: true,   // removes background noise
+        autoGainControl:  true,   // keeps volume consistent
+        // ── Best quality settings ───────────────────────────────────────
+        channelCount:     1,      // mono — less bleed
+        sampleRate:       48000,  // 48kHz — best voice quality
+      },
+      video: false,
+    });
 
     // Start MUTED — user taps to speak
     isMuted = true;
-    setMicEnabled(false);
-    log('Mic ready ✓  NC: ' + (ncOn ? 'ON' : 'OFF'), 'l-ok');
+    setMic(false);
+    log('Mic ready ✓ (browser native processing)', 'l-ok');
   } catch(e) {
     toast('Mic access denied — please allow microphone');
     myName = ''; myRoom = '';
@@ -649,7 +457,7 @@ async function joinRoom() {
   $('roomCodeDisplay').textContent = code;
   $('headerSub').textContent       = 'Room ' + code + ' · ' + name;
 
-  // Add self to list
+  // Add self to riders list
   $('ridersList').innerHTML = '';
   const me = document.createElement('div');
   me.className = 'rider-item';
@@ -664,7 +472,7 @@ async function joinRoom() {
   $('ridersList').appendChild(me);
   updCnt();
 
-  // Reset UI to muted state
+  // Set UI to muted state
   updateMicUI();
 
   // Connect to server
@@ -674,46 +482,28 @@ async function joinRoom() {
   btn.textContent = 'JOIN';
 }
 
-// ── Leave room ────────────────────────────────────────
+// ── Leave ─────────────────────────────────────────────
 function leaveRoom() {
-  // Reset all state
   isMuted = true;
   voxOn   = false;
   myName  = '';
   myRoom  = '';
 
-  // Stop VOX
   stopVOX();
-
-  // Stop mic
-  setMicEnabled(false);
+  setMic(false);
   sock?.emit('speaking', { value: false });
 
-  // Close all peer connections
   Object.keys(PCS).forEach(sid => {
-    try { PCS[sid].close(); } catch(e) {}
+    try { PCS[sid].close(); } catch(e){}
     killAudio(sid);
     delete PCS[sid];
   });
 
-  // Cleanup audio context
-  if (noiseCtx) { try { noiseCtx.close(); } catch(e){} noiseCtx = null; }
-  cleanStream = null;
+  if (myStream) { myStream.getTracks().forEach(t => t.stop()); myStream = null; }
 
-  // Stop microphone tracks
-  if (myStream) {
-    myStream.getTracks().forEach(t => t.stop());
-    myStream = null;
-  }
+  if (sock) { sock.removeAllListeners(); try { sock.disconnect(); } catch(e){} sock = null; }
 
-  // Disconnect socket
-  if (sock) {
-    sock.removeAllListeners();
-    try { sock.disconnect(); } catch(e){}
-    sock = null;
-  }
-
-  $('statusDot').className  = 'status-dot';
+  $('statusDot').className   = 'status-dot';
   $('headerSub').textContent = 'Helmet Intercom';
   setSig(0);
   showScreen('screenJoin');
@@ -721,7 +511,7 @@ function leaveRoom() {
   detectServer();
 }
 
-// ── QR Code ───────────────────────────────────────────
+// ── QR ────────────────────────────────────────────────
 async function showQR() {
   if (!myRoom) return;
   const url = location.origin + '/?room=' + myRoom;
@@ -740,13 +530,13 @@ function copyCode() {
     .catch(() => toast('Code: ' + myRoom));
 }
 
-// ── Server health ─────────────────────────────────────
+// ── Health ────────────────────────────────────────────
 async function detectServer() {
   const el  = $('serverStatusText');
   const dot = qs('.server-status .dot');
   try {
     const d = await (await fetch('/health', { signal: AbortSignal.timeout(5000) })).json();
-    el.textContent = (d.platform === 'railway' ? 'Railway ✅' : 'Local ✅') + ' · ' + d.uptime + 's uptime';
+    el.textContent = (d.platform === 'railway' ? 'Railway ✅' : 'Local ✅') + ' · ' + d.uptime + 's';
     dot.className  = 'dot dot-ok';
     const cn = $('certNotice');
     if (cn) cn.style.display = (d.platform !== 'railway' && location.protocol === 'https:') ? 'block' : 'none';
